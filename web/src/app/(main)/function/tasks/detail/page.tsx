@@ -5,7 +5,16 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  ArrowLeftIcon,
+  BrainIcon,
+  CheckIcon,
+  CircleAlertIcon,
+  PauseIcon,
+  PlayIcon,
+  SquareIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
@@ -83,7 +92,7 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
   const exhausted = task.llm_failover_state === "chain_exhausted";
   // 任何状态都可以改链,终态也不例外:任务结束后主 Agent 对话仍走这条链,
   // 链上模型出问题时必须能换掉,否则已完成任务就没法继续交互。
-  const terminal = ["done", "failed", "timeout"].includes(task.status);
+  const terminal = ["done", "failed", "timeout", "stopped"].includes(task.status);
   // A null active profile on an exhausted, non-empty chain is a persisted end
   // cursor. Keep the status display honest; choosing the first profile is only
   // the editor's reset draft and does not mean it is currently active.
@@ -213,6 +222,7 @@ function TaskDetailInner() {
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
+  const [stopping, setStopping] = React.useState(false);
 
   React.useEffect(() => {
     api
@@ -276,7 +286,7 @@ function TaskDetailInner() {
   }, [load]);
 
   async function togglePause() {
-    if (task && ["done", "failed", "timeout"].includes(task.status)) return;
+    if (task && ["done", "failed", "timeout", "stopped"].includes(task.status)) return;
     const next = !paused;
     try {
       await api.controlTask(id, next ? "pause" : "resume");
@@ -284,6 +294,22 @@ function TaskDetailInner() {
       toast.success(next ? "已暂停探索" : "已恢复探索");
     } catch (e) {
       toast.error("操作失败：" + (e as Error).message);
+    }
+  }
+
+  // stopTask 彻底终止任务(stopped 终态,不可恢复):停 planner/worker 与主 Agent
+  // 对话轮、清排队。5s 轮询会把状态徽标刷成「已停止」,这里主动 load() 立即反馈。
+  async function stopTask() {
+    if (!task || stopping) return;
+    setStopping(true);
+    try {
+      await api.stopTask(task.id);
+      toast.success("任务已停止");
+      load();
+    } catch (error) {
+      toast.error(`停止失败：${(error as Error).message}`);
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -316,7 +342,7 @@ function TaskDetailInner() {
   }
 
   const completed = task.status === "done";
-  const terminal = ["done", "failed", "timeout"].includes(task.status);
+  const terminal = ["done", "failed", "timeout", "stopped"].includes(task.status);
   const archiveLifecycleEligible = terminal || paused || task.status === "paused";
   const canArchive = archiveLifecycleEligible && !task.archive_blocked_by_task_id;
   let archiveDisabledReason = task.queued ? "排队中的任务必须先暂停" : "运行中的任务必须先暂停";
@@ -391,6 +417,35 @@ function TaskDetailInner() {
               </TooltipTrigger>
               <TooltipContent>{archiveDisabledReason}</TooltipContent>
             </Tooltip>
+          )}
+          {!terminal && (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button size="sm" variant="outline" disabled={stopping} title="停止任务（彻底终止，不可恢复）">
+                  {stopping ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <SquareIcon className="text-destructive" data-icon="inline-start" />
+                  )}
+                  停止
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>停止任务 #{task.id}？</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    停止会彻底终止任务的 Planner/Worker 与主 Agent
+                    对话轮，并清理排队记录。任务将进入「已停止」终态，此后不可继续运行；会话、漏洞等历史记录保留可查。此操作不可撤销。
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>取消</AlertDialogCancel>
+                  <AlertDialogAction variant="destructive" onClick={() => void stopTask()}>
+                    确认停止
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           )}
           <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
             {controlIcon}

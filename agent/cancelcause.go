@@ -35,6 +35,8 @@ var (
 		"任务正在删除（DELETE /api/tasks/{id}），删除屏障已取消该任务正在运行的 Planner、Worker 和主 Agent；本次运行结果不会再被使用")
 	AbortPausedOnReload = cause("paused_on_reload", "后端恢复了任务的暂停状态",
 		"后端启动时根据数据库中持久化的状态恢复了任务暂停。本次运行被取消；正常情况下恢复阶段没有正在运行的 Agent")
+	AbortStoppedByUser = cause("stopped_by_user", "用户停止了任务",
+		"用户通过停止接口（POST /api/tasks/{id}/stop）彻底终止了任务。任务已进入终态 stopped，Planner/Worker 运行与主 Agent 对话轮被取消；运行中的意图标记为 stopped，任务此后不可继续（resume）")
 	AbortGoalMet = cause("goal_met", "规划者判定任务目标已达成",
 		"规划者判定任务目标已达成并将任务置为 done，随后取消仍在运行的 Worker；这些意图会标记为 stopped，而不是失败")
 	AbortSettleDrainTimeout = cause("settle_drain_timeout", "任务超时收尾的等待时间已用尽",
@@ -57,6 +59,8 @@ var (
 		"用户点击了停止，主动中止本轮主 Agent 或会话 Agent 运行。已经产生的活动记录会保留，可以继续发送下一条消息")
 	AbortChatPausedWithTask = cause("chat_paused_with_task", "任务暂停并中止了主 Agent 对话",
 		"用户暂停任务时，正在运行的主 Agent 对话也被同步取消。已经产生的活动记录会保留；恢复任务后不会自动重放本轮消息")
+	AbortChatStoppedWithTask = cause("chat_stopped_with_task", "任务停止并中止了主 Agent 对话",
+		"用户停止任务时，正在运行的主 Agent 对话轮也被同步取消。已经产生的活动记录会保留")
 	AbortChatTurnFinished = cause("chat_turn_finished", "本轮对话已正常结束并释放 context",
 		"本轮对话已正常结束，服务端正在释放该轮 context 资源。这不是运行中断；若它出现在中断消息中，说明取消与收场事件发生了竞态")
 

@@ -15,7 +15,15 @@ services:
     restart: unless-stopped
 
   artex:
-    image: autumn27/artex:${ARTEX_TAG:-latest}
+    # 需先准备好 dist/<arch>/artex 二进制（见 Dockerfile 头部注释），
+    # 然后 docker compose up -d --build。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 构建步骤用宿主机网络，以便直接使用宿主机上的本地代理
+      # （gg 转发的 http://127.0.0.1:3128，见下方 build.command）
+      network: host
+    image: artex:local
     depends_on:
       postgres:
         condition: service_healthy

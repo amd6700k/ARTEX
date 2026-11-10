@@ -128,6 +128,12 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	}
 	defer s.engine.decInflight(t.ID)
 	lifecycle := t.lifecycleSnapshot()
+	// 用户停止(stopped)是用户主动的永久终态:重跑意图/新增目标/深化发现等一切
+	// 复活入口都不得把它拉回 running。rerun/deepen 的调用方已有回滚逻辑,会恢复
+	// 被重开的意图状态。
+	if lifecycle.Status == "stopped" {
+		return false, fmt.Errorf("任务已被用户停止，不能重新拉起")
+	}
 	if requirePaused {
 		if isTerminalStatus(lifecycle.Status) {
 			return false, fmt.Errorf("终态任务不能执行继续")

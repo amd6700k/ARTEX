@@ -36,6 +36,7 @@ import {
   SaveIcon,
   SearchIcon,
   SlidersHorizontalIcon,
+  SquareIcon,
   StarIcon,
   TagsIcon,
   Trash2Icon,
@@ -236,6 +237,7 @@ const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
   { value: "done", label: "已完成" },
   { value: "failed", label: "失败" },
   { value: "timeout", label: "已超时" },
+  { value: "stopped", label: "已停止" },
 ];
 
 // Select 不接受空字符串 value,所以「无分类」在筛选器、新建表单和批量移动里
@@ -243,16 +245,26 @@ const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
 const UNCATEGORIZED_VALUE = "uncategorized";
 
 // 可暂停 = 非终态且未暂停,与后端 applyTaskControlWithCause 的门控一致
-// (done/failed/timeout 为终态);paused 才可继续。行内按钮与批量控制共用此判断,
+// (done/failed/timeout/stopped 为终态);paused 才可继续。行内按钮与批量控制共用此判断,
 // 两边不会出现一个可点、另一个不可点的分歧。
 const PAUSABLE_STATUSES = new Set<TaskStatus>(["created", "queued", "running"]);
-const ARCHIVABLE_STATUSES = new Set<TaskStatus>(["paused", "done", "failed", "timeout"]);
+const ARCHIVABLE_STATUSES = new Set<TaskStatus>(["paused", "done", "failed", "timeout", "stopped"]);
+// 可停止 = 非终态即可(created/queued/running/paused),与后端 applyTaskStop 的门控一致:
+// 暂停后不想继续、排队中不想等待,都可以彻底终止;终态(stopped)不可再停。
+const STOPPABLE_STATUSES = new Set<TaskStatus>(["created", "queued", "running", "paused"]);
 
 function taskControlAction(status: TaskStatus): "pause" | "resume" | null {
   if (status === "paused") return "resume";
   if (PAUSABLE_STATUSES.has(status)) return "pause";
   return null;
 }
+
+// 三态动作的中文名查表而非嵌套三元:仓库 Biome 基线禁 noNestedTernary。
+const TASK_CONTROL_LABELS: Record<"pause" | "resume" | "stop", string> = {
+  pause: "暂停",
+  resume: "继续",
+  stop: "停止",
+};
 
 type TaskSortField = "id" | "created" | "duration" | "status";
 
@@ -321,7 +333,7 @@ export default function TasksPage() {
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(20);
   const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
-  const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | null>(null);
+  const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | "stop" | null>(null);
   const [movingCategory, setMovingCategory] = React.useState(false);
 
   React.useEffect(() => {
@@ -543,18 +555,24 @@ export default function TasksPage() {
     [load],
   );
 
-  // controlTask 是行内暂停/继续:批量走 controlTasksBatch,单行走单任务接口,省去
+  // controlTask 是行内暂停/继续/停止:批量走 controlTasksBatch,单行走单任务接口,省去
   // 「先勾选再点批量」。清空 lastRef 让下一次轮询即使负载相同也照单接收,否则状态
   // 回写会被去重挡掉、按钮看起来没反应。
   const controlTask = React.useCallback(
-    async (id: string, action: "pause" | "resume") => {
+    async (id: string, action: "pause" | "resume" | "stop") => {
+      const label = TASK_CONTROL_LABELS[action];
       try {
-        const result = await api.controlTask(id, action);
-        toast.success(
-          action === "pause" ? `任务 #${id} 已暂停` : `任务 #${id} 已继续${result.queued ? "，已进入队列" : ""}`,
-        );
+        if (action === "stop") {
+          await api.stopTask(id);
+          toast.success(`任务 #${id} 已停止`);
+        } else {
+          const result = await api.controlTask(id, action);
+          toast.success(
+            action === "pause" ? `任务 #${id} 已暂停` : `任务 #${id} 已继续${result.queued ? "，已进入队列" : ""}`,
+          );
+        }
       } catch (e) {
-        toast.error(`${action === "pause" ? "暂停" : "继续"}失败：${(e as Error).message}`);
+        toast.error(`${label}失败：${(e as Error).message}`);
       } finally {
         // 无论成败都刷新:失败多半是状态已变化,重新拉取才能让按钮回到正确形态。
         lastRef.current = "";
@@ -679,6 +697,10 @@ export default function TasksPage() {
     () => selectedTasks.filter((task) => taskControlAction(task.status) === "resume").map((task) => task.id),
     [selectedTasks],
   );
+  const stoppableTaskIDs = React.useMemo(
+    () => selectedTasks.filter((task) => STOPPABLE_STATUSES.has(task.status)).map((task) => task.id),
+    [selectedTasks],
+  );
   const archivableTaskIDs = React.useMemo(
     () => selectedTasks.filter((task) => ARCHIVABLE_STATUSES.has(task.status) && !task.queued).map((task) => task.id),
     [selectedTasks],
@@ -705,23 +727,29 @@ export default function TasksPage() {
   }, [archivableTaskIDs, load]);
 
   const controlSelectedTasks = React.useCallback(
-    async (action: "pause" | "resume", ids: string[]) => {
+    async (action: "pause" | "resume" | "stop", ids: string[]) => {
       if (ids.length === 0 || batchControlling) return;
       if (ids.length > 100) {
         toast.error("一次最多控制 100 个任务");
         return;
       }
+      const batchLabel = `批量${TASK_CONTROL_LABELS[action]}`;
       setBatchControlling(action);
       try {
         const result = await api.controlTasksBatch(ids, action);
         const succeeded = result.items.filter((item) => item.ok);
         const failed = result.items.filter((item) => !item.ok);
         if (succeeded.length > 0) {
-          toast.success(
-            action === "pause"
-              ? `已暂停 ${succeeded.length} 个任务`
-              : `已继续 ${succeeded.length} 个任务${succeeded.some((item) => item.queued) ? "，部分任务已进入队列" : ""}`,
-          );
+          // 三态文案分写而非嵌套三元:仓库 Biome 基线禁 noNestedTernary。
+          if (action === "stop") {
+            toast.success(`已停止 ${succeeded.length} 个任务`);
+          } else if (action === "pause") {
+            toast.success(`已暂停 ${succeeded.length} 个任务`);
+          } else {
+            toast.success(
+              `已继续 ${succeeded.length} 个任务${succeeded.some((item) => item.queued) ? "，部分任务已进入队列" : ""}`,
+            );
+          }
         }
         if (failed.length > 0) {
           const details = failed
@@ -733,7 +761,7 @@ export default function TasksPage() {
         lastRef.current = "";
         load();
       } catch (error) {
-        toast.error(`${action === "pause" ? "批量暂停" : "批量继续"}失败：${(error as Error).message}`);
+        toast.error(`${batchLabel}失败：${(error as Error).message}`);
       } finally {
         setBatchControlling(null);
       }
@@ -875,6 +903,18 @@ export default function TasksPage() {
                       )}
                       继续 {resumableTaskIDs.length}
                     </Button>
+                  )}
+                  {stoppableTaskIDs.length > 0 && (
+                    <StopConfirmDialog
+                      count={stoppableTaskIDs.length}
+                      onConfirm={() => controlSelectedTasks("stop", stoppableTaskIDs)}
+                      trigger={
+                        <Button size="sm" variant="outline" disabled={batchControlling !== null}>
+                          <SquareIcon className="text-destructive" data-icon="inline-start" />
+                          停止 {stoppableTaskIDs.length}
+                        </Button>
+                      }
+                    />
                   )}
                   {archivableTaskIDs.length > 0 && (
                     <ArchiveConfirmDialog
@@ -1170,7 +1210,7 @@ const TaskRow = React.memo(function TaskRow({
   task: Task;
   nowSec: number;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
-  onControl: (id: string, action: "pause" | "resume") => Promise<void>;
+  onControl: (id: string, action: "pause" | "resume" | "stop") => Promise<void>;
   onRename: (task: Task, name: string) => Promise<void>;
   onTogglePinned: (task: Task) => Promise<void>;
   onArchive: (task: Task) => Promise<void>;
@@ -1223,9 +1263,7 @@ const TaskRow = React.memo(function TaskRow({
           const f = task.findings;
           const total = f ? f.critical + f.high + f.medium + f.low : 0;
           if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
-          const seg = (n: number, cls: string) => (
-            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
-          );
+          const seg = (n: number, cls: string) => <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>;
           return (
             <span className="font-medium whitespace-nowrap" title="严重 / 高 / 中 / 低">
               {seg(f.critical, "text-rose-600 dark:text-rose-400")}
@@ -1288,6 +1326,7 @@ const TaskRow = React.memo(function TaskRow({
             </Link>
           </Button>
           <TaskControlButton task={task} onControl={onControl} />
+          <TaskStopButton task={task} onControl={onControl} />
           <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
           <TaskArchiveAction task={task} onArchive={onArchive} />
           <DeleteTaskDialog task={task} onDelete={onDelete} />
@@ -1461,6 +1500,93 @@ function TaskControlButton({
     >
       {taskControlIcon(pending, action)}
     </Button>
+  );
+}
+
+// TaskStopButton 是行内的停止开关:把任务送入 stopped 终态(不可恢复)。终态任务
+// 渲染为 disabled 而不是隐藏,与 TaskControlButton 一致保持操作列宽度;停止不可回滚,
+// 必须经 StopConfirmDialog 确认。
+function TaskStopButton({
+  task,
+  onControl,
+}: {
+  task: Task;
+  onControl: (id: string, action: "pause" | "resume" | "stop") => Promise<void>;
+}) {
+  const [pending, setPending] = React.useState(false);
+  const stoppable = STOPPABLE_STATUSES.has(task.status);
+  return (
+    <StopConfirmDialog
+      count={1}
+      onConfirm={async () => {
+        setPending(true);
+        try {
+          await onControl(task.id, "stop");
+        } finally {
+          setPending(false);
+        }
+      }}
+      trigger={
+        <Button
+          size="icon"
+          variant="ghost"
+          aria-label={`停止任务 #${task.id}`}
+          title={stoppable ? "停止任务（彻底终止，不可恢复）" : "该状态不可停止"}
+          disabled={!stoppable || pending}
+        >
+          {pending ? <Loader2Icon className="animate-spin" /> : <SquareIcon />}
+        </Button>
+      }
+    />
+  );
+}
+
+// StopConfirmDialog 是单任务/批量停止共用的确认框。停止是用户主动的永久终态
+// (区别于可恢复的暂停),确认文案写明不可撤销,避免误触。
+function StopConfirmDialog({
+  count,
+  trigger,
+  onConfirm,
+}: {
+  count: number;
+  trigger: React.ReactNode;
+  onConfirm: () => Promise<void>;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [pending, setPending] = React.useState(false);
+  return (
+    <AlertDialog open={open} onOpenChange={(next) => !pending && setOpen(next)}>
+      <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{count === 1 ? "停止任务" : `停止 ${count} 个任务`}</AlertDialogTitle>
+          <AlertDialogDescription className="[overflow-wrap:anywhere]">
+            停止会彻底终止任务的 Planner/Worker 与主 Agent
+            对话轮，并清理排队记录。任务将进入「已停止」终态，此后不可继续运行；会话、漏洞等历史记录保留可查。此操作不可撤销。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={pending}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={pending}
+            onClick={async (event) => {
+              event.preventDefault();
+              setPending(true);
+              try {
+                await onConfirm();
+                setOpen(false);
+              } finally {
+                setPending(false);
+              }
+            }}
+          >
+            {pending && <Spinner data-icon="inline-start" />}
+            确认停止
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }
 

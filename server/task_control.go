@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -149,6 +150,84 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 	return out, nil
 }
 
+// applyTaskStop is shared by the single and batch stop endpoints. Unlike pause,
+// stop is final: the terminal state commits first (the CAS is the authoritative
+// idempotence guard), then the engine pause gate blocks new claims while the
+// named stop cause cancels in-flight runs (runIntent classifies them as stopped),
+// and the main-agent turn is aborted last. A committed stop never rolls back —
+// failures surface as 409 before the commit.
+func (s *Server) applyTaskStop(t *Task) (taskControlResult, error) {
+	out := taskControlResult{ID: t.ID}
+	if t == nil {
+		return out, fmt.Errorf("task not found")
+	}
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
+	// Re-resolve the handle under the lock so a request that captured the pointer
+	// before deletion cannot stop a stale task past StopTask's teardown.
+	current, exists := s.m.Task(t.ID)
+	if !exists || current != t || s.engine.IsDeleting(t.ID) {
+		return out, fmt.Errorf("任务正在删除，无法停止")
+	}
+	if !s.engine.beginTaskOperation(t.ID) {
+		return out, fmt.Errorf("任务正在删除，无法停止")
+	}
+	defer s.engine.decInflight(t.ID)
+	if isTerminalStatus(t.lifecycleSnapshot().Status) {
+		return out, fmt.Errorf("任务已是终态，无需停止")
+	}
+	won, err := s.m.ApplyTaskStop(t.ID)
+	if err != nil {
+		return out, err
+	}
+	if !won {
+		return out, fmt.Errorf("任务已是终态，无需停止")
+	}
+	// 暂停门:阻断 execContextFor 发新 ctx / worker 领取;在跑 run 的取消由 Pause 内的
+	// cancelExec 携带 AbortStoppedByUser 完成,runIntent 按该 cause 归类为 stopped。
+	s.engine.Pause(t.ID, agent.AbortStoppedByUser)
+	s.cancelTaskChat(t.ID, agent.AbortChatStoppedWithTask)
+	go s.stopTaskFrontier(t)
+	out.Status = "stopped"
+	log.Printf("[task] #%s 已停止", t.ID)
+	go s.reconcileConcurrency()
+	return out, nil
+}
+
+// stopTaskFrontier waits for in-flight runs (including ones still inside the
+// runIntent entry race that would return their claim to the frontier) to drain,
+// then settles the residual open/paused intents to stopped — a stopped task keeps
+// no recoverable frontier.
+func (s *Server) stopTaskFrontier(t *Task) {
+	deadline := time.Now().Add(10 * time.Second)
+	for s.engine.inflightCount(t.ID) > 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n, err := t.Store.StopOpenIntents(); err != nil {
+		log.Printf("[task] #%s 停止后清理意图前沿失败: %v", t.ID, err)
+	} else if n > 0 {
+		log.Printf("[task] #%s 停止后清理 %d 条前沿意图为 stopped", t.ID, n)
+	}
+	t.Notify()
+}
+
+// stopTask permanently terminates a task: planner/workers and the main-agent turn
+// are cancelled, queued admission is dropped, and the task enters the stopped
+// terminal state. History (sessions, findings, activity) stays browsable.
+func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.m.Task(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	result, err := s.applyTaskStop(t)
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
 // intentSummaryOf 取意图 payload 里的 summary,供删除通知在意图节点消失(真删除)前留档。
 func intentSummaryOf(n *db.Node) string {
 	if n == nil {
@@ -253,8 +332,8 @@ func (s *Server) controlTasksBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" {
-		writeErr(w, 400, "action must be pause|resume")
+	if req.Action != "pause" && req.Action != "resume" && req.Action != "stop" {
+		writeErr(w, 400, "action must be pause|resume|stop")
 		return
 	}
 	taskIDs := normalizeBatchTaskIDs(req.TaskIDs)
@@ -276,7 +355,13 @@ func (s *Server) controlTasksBatch(w http.ResponseWriter, r *http.Request) {
 			items = append(items, item)
 			continue
 		}
-		result, err := s.applyTaskControl(t, req.Action)
+		var result taskControlResult
+		var err error
+		if req.Action == "stop" {
+			result, err = s.applyTaskStop(t)
+		} else {
+			result, err = s.applyTaskControl(t, req.Action)
+		}
 		if err != nil {
 			item.Error = err.Error()
 		} else {

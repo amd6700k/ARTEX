@@ -319,6 +319,21 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 	return n, nil
 }
 
+// StopOpenIntents settles every frontier intent (open/paused) in this exploration to
+// 'stopped' once the task has been stopped by the user. A stopped task is terminal and
+// keeps no recoverable frontier. running intents are not touched here — live runs
+// classify themselves via the stop cause in runIntent; soft-deleted intents carry
+// state='deleted' and are excluded by the same IN list.
+func (s *ExplorationStore) StopOpenIntents() (int64, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='stopped', completed_at=COALESCE(completed_at, now())
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','paused')`, s.expID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ReopenIntent flips ONE not-successfully-finished intent (blocked/exhausted/stopped)
 // back to 'open' so a worker re-claims it (graph writes it already produced stay).
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.

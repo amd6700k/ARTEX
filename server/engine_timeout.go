@@ -185,6 +185,11 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	if !e.markSettling(t.ID) {
 		return
 	}
+	// stop(或删除)已先行提交终态:不再跑终局规划轮——Guarded 落状态也必输,白烧一轮 LLM。
+	if isTerminalStatus(e.m.TaskStatus(t.ID)) {
+		log.Printf("[deadline] task %s 超时协调器唤醒时已是终态,跳过收尾时序", t.ID)
+		return
+	}
 	log.Printf("[deadline] task %s 到达超时上限,进入收尾时序", t.ID)
 
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);

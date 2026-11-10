@@ -37,7 +37,7 @@ type Task struct {
 	CompanyIDs         []int64    `json:"company_ids,omitempty"`
 	ParentRef          string     `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
 	CreatedAt          time.Time  `json:"created_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
+	CompletedAt        *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout/stopped)的时刻;非终态为 nil
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。
 	TimeoutSeconds int        `json:"timeout_seconds"`        // 0=不限时
 	FirstRunAt     *time.Time `json:"first_run_at,omitempty"` // 首次真正开始运行的时刻(非 created_at);nil=尚未运行
@@ -72,7 +72,7 @@ type TaskDeletePreparation struct {
 // IsTerminal reports whether a task status is a terminal (finished) state.
 // 单一真源，替换散落各处的 done/failed 硬编码判定。
 func IsTerminal(status string) bool {
-	return status == "done" || status == "failed" || status == "timeout"
+	return status == "done" || status == "failed" || status == "timeout" || status == "stopped"
 }
 
 // CreateTask creates an exploration + task in one transaction and returns the task.
@@ -474,14 +474,14 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 }
 
 // SetStatus updates a task's lifecycle status. Entering a terminal state
-// (done/failed/timeout) stamps completed_at once (COALESCE keeps the first stamp
+// (done/failed/timeout/stopped) stamps completed_at once (COALESCE keeps the first stamp
 // stable); moving back to a non-terminal state clears it, so a re-run has no stale
 // finish time.
 func (d *DB) SetStatus(id int64, status string) error {
 	_, err := d.Exec(`
 UPDATE tasks
    SET status = $1,
-       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
+       completed_at = CASE WHEN $1 IN ('done','failed','timeout','stopped') THEN COALESCE(completed_at, now()) ELSE NULL END
  WHERE id = $2`, status, id)
 	return err
 }
@@ -495,7 +495,7 @@ func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err er
 UPDATE tasks
    SET status = $1,
        completed_at = COALESCE(completed_at, now())
- WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id)
+ WHERE id = $2 AND status NOT IN ('done','failed','timeout','stopped')`, status, id)
 	if err != nil {
 		return false, err
 	}

@@ -269,7 +269,12 @@ func (s *Server) restoreTaskRuntimes() {
 		lifecycle := t.lifecycleSnapshot()
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
-		if n, _ := t.Store.ResetRunningIntents(); n > 0 {
+		// stopped 任务是永久终态、不保留可恢复前沿:残留 running 连同前沿一起落 stopped。
+		if lifecycle.Status == "stopped" {
+			if n, _ := t.Store.StopOpenIntents(); n > 0 {
+				log.Printf("[engine] task %s 重启后清理 %d 条残留意图为 stopped", t.ID, n)
+			}
+		} else if n, _ := t.Store.ResetRunningIntents(); n > 0 {
 			log.Printf("[engine] task %s 重置 %d 个残留 running 意图为 open", t.ID, n)
 		}
 		if lifecycle.Paused {
@@ -726,6 +731,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
 	mux.HandleFunc("DELETE /api/tasks/{id}/constraints/{cid}", s.deleteConstraint) // 约束管理:删除约束
 	mux.HandleFunc("POST /api/tasks/{id}/control", s.control)
+	mux.HandleFunc("POST /api/tasks/{id}/stop", s.stopTask)
 	mux.HandleFunc("PUT /api/tasks/{id}/llm", s.updateTaskLLMProfiles)
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/control", s.controlIntent)

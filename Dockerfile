@@ -14,9 +14,13 @@ FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 国内网络优化：apt 源换清华镜像并绕过代理直连（构建代理只留给 npm/Playwright 层）。
+# 如需还原上游行为，删除本行开头的 sed/unset 即可。
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+    && sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap gobuster \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -25,7 +29,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
 # 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+# 国内网络优化：绕过构建代理直连，浏览器改用 npmmirror 国内镜像源
+# （海外构建请删掉 unset 与 export 两行前缀）。
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+    && export PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+    && npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*

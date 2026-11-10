@@ -1,7 +1,7 @@
 // ARTEX domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
-export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
+export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout" | "stopped";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
 export interface Task {

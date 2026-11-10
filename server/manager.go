@@ -53,7 +53,7 @@ type Task struct {
 	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
 	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
-	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
+	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout/stopped 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
@@ -1166,7 +1166,7 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	err = m.pg.QueryRow(`UPDATE tasks
 	SET status=$2,
 	    completed_at=CASE
-	        WHEN $2 IN ('done','failed','timeout') THEN COALESCE(completed_at, now())
+	        WHEN $2 IN ('done','failed','timeout','stopped') THEN COALESCE(completed_at, now())
 	        ELSE NULL
 	    END,
 	    paused=false,
@@ -1243,7 +1243,7 @@ func (m *Manager) ApplyTaskPause(id string) error {
 	err = m.pg.QueryRow(`UPDATE tasks
 		SET paused=true, queued=false, queued_at=NULL
 		WHERE id=$1 AND deleted_at IS NULL AND paused=false
-		  AND status NOT IN ('done','failed','timeout')
+		  AND status NOT IN ('done','failed','timeout','stopped')
 		RETURNING COALESCE(queue_mode,'')`, n).Scan(&mode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("task %s is unavailable for pause", id)
@@ -1262,6 +1262,48 @@ func (m *Manager) ApplyTaskPause(id string) error {
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+// ApplyTaskStop atomically commits the user-stop terminal state, clearing the
+// pause flag and queue metadata in the same UPDATE so a stopped task fully
+// leaves the concurrency queue. CAS: rows already terminal (done/failed/timeout/
+// stopped) or deleted are never rewritten — won=false tells the caller to report
+// a conflict instead of clobbering an existing terminal state.
+func (m *Manager) ApplyTaskStop(id string) (bool, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return false, err
+	}
+	res, err := m.pg.Exec(`UPDATE tasks
+		SET status='stopped',
+		    completed_at=COALESCE(completed_at, now()),
+		    paused=false, queued=false, queued_at=NULL, queue_mode=''
+		WHERE id=$1 AND deleted_at IS NULL
+		  AND status NOT IN ('done','failed','timeout','stopped')`, n)
+	if err != nil {
+		return false, err
+	}
+	won, _ := res.RowsAffected()
+	if won == 0 {
+		return false, nil
+	}
+	m.mu.Lock()
+	if t := m.tasks[id]; t != nil {
+		t.updateLifecycle(func(state *taskLifecycleState) {
+			state.Status = "stopped"
+			state.Paused = false
+			state.Queued = false
+			state.QueuedAt = 0
+			state.QueueMode = ""
+			if state.CompletedAt == 0 {
+				state.CompletedAt = time.Now().Unix()
+			}
+		})
+	}
+	m.mu.Unlock()
+	return true, nil
 }
 
 // EnqueueTask persists the concurrency hold and syncs the in-memory handle.

@@ -54,6 +54,9 @@ const task: Record<string, StatusMeta> = {
   done: { label: "已完成", tone: "green" },
   failed: { label: "失败", tone: "red" },
   timeout: { label: "已超时", tone: "amber" },
+  // stopped = 用户主动彻底终止（终态，不可恢复）。与 failed 区分：failed 是故障，
+  // stopped 是人为终止，用中性灰。
+  stopped: { label: "已停止", tone: "slate" },
 };
 
 const severity: Record<string, StatusMeta> = {

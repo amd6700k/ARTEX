@@ -314,7 +314,10 @@ export const api = {
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
   controlTask: (id: string, action: "pause" | "resume") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
-  controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>
+  // stop = 彻底终止任务(终态 stopped):停 planner/worker 与主 Agent 对话轮、清排队,
+  // 不可恢复;历史记录保留可查。
+  stopTask: (id: string) => post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/stop`),
+  controlTasksBatch: (taskIds: string[], action: "pause" | "resume" | "stop") =>
     post<{ items: BatchControlItem[] }>("/tasks/control/batch", { task_ids: taskIds, action }),
   taskArchives: (input?: { page?: number; size?: number; q?: string; state?: string }) => {
     const query = new URLSearchParams();
@@ -825,8 +828,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;

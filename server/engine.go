@@ -885,13 +885,18 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
-			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
+			// 用 Guarded 版做 CAS：迟到的 met 判定不得覆盖并发的 stop/delete 终态。
+			won, err := e.m.SetTaskStatusGuarded(t.ID, "done")
+			if err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
 			}
 			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
-			// 归为 stopped(而非 blocked)。
-			e.cancelExec(t.ID, agent.AbortGoalMet)
+			// 归为 stopped(而非 blocked)。输掉 CAS(如 stop 已先行)则不动——stop 的取消
+			// 原因已附着在 exec ctx 上,不得被 GoalMet 覆盖。
+			if won {
+				e.cancelExec(t.ID, agent.AbortGoalMet)
+			}
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
@@ -1097,6 +1102,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
+	// 用户停止(stop):任务被彻底终止,被取消的 run 不回 frontier、不标 exhausted/blocked,
+	// 统一落 stopped。必须排在 settling 分支之前,避免 stop 与超时收尾并发时误归 exhausted。
+	if ectx.Err() != nil && isTaskStoppedCause(context.Cause(ectx)) {
+		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 停止状态落库失败: %v", name, t.ID, intent.ID, err)
+		}
+		log.Printf("[worker %s] task %s 意图 #%d 因任务被停止而结束(stopped)，写回 %s", name, t.ID, intent.ID, wrote)
+		e.touch(t.ID)
+		return true
+	}
 	// 任务超时收尾的硬兜底 cancel(非 pause、非 kill)取消了本 run → 归为 exhausted(已收尾),
 	// 不要误标 blocked。此时 worker 通常已在 settlement 阶段把结果写回。
 	if ectx.Err() != nil && e.isSettling(t.ID) {
@@ -1223,6 +1238,17 @@ func taskExecutionPaused(cause error) bool {
 	default:
 		return false
 	}
+}
+
+// isTaskStoppedCause reports whether the cancellation cause is a user task stop.
+// stop 的意图归类必须按 cause 判定而不是按任务状态:取消与终态提交之间存在窗口,
+// 且 stop 复用 Pause 的暂停门(paused_race_guard),按状态会把该窗口内的 run 误标回 open。
+func isTaskStoppedCause(cause error) bool {
+	var abort *agent.AbortCause
+	if !errors.As(cause, &abort) {
+		return false
+	}
+	return abort.Code == "stopped_by_user"
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) (done bool) {

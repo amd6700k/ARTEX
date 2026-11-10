@@ -564,6 +564,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
     WHERE deleted_at IS NULL AND pinned_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at DESC)
     WHERE archived_at IS NOT NULL;
+-- 终态增加 stopped(用户主动彻底终止);补旧库。早期安装的 status CHECK 是内联
+-- 自动命名约束(tasks_status_check),找到不含 stopped 的旧定义删掉重建。
+DO $$
+DECLARE cname text;
+BEGIN
+    SELECT conname INTO cname FROM pg_constraint
+     WHERE conrelid='tasks'::regclass AND contype='c'
+       AND pg_get_constraintdef(oid) LIKE '%status%'
+       AND pg_get_constraintdef(oid) NOT LIKE '%stopped%';
+    IF cname IS NOT NULL THEN
+        EXECUTE 'ALTER TABLE tasks DROP CONSTRAINT '||quote_ident(cname);
+    END IF;
+END $$;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
+    CHECK (status IN ('created','running','paused','done','failed','timeout','stopped'));
 
 -- Cold task archives retain only compact metadata in PostgreSQL. The complete
 -- task payload lives in a versioned .tar.zst package under data/archives/tasks.
