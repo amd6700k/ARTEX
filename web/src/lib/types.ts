@@ -1331,6 +1331,7 @@ export interface JudgeConfig {
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  task_whitelist_enabled: boolean; // 任务白名单闸门的模型复核(提取器疑似越界时终审),独立于 enabled
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。

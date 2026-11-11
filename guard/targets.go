@@ -2,7 +2,6 @@ package guard
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net"
 	"net/url"
 	"regexp"
@@ -78,6 +77,12 @@ type toolSpec struct {
 	hostFlag   bool // -host/--host 承载目标
 	portFlag   bool // -p/--port 承载端口说明
 	multiPort  bool // 无 -p 时按全端口处理（Port="*"，保守）
+	// portPair: host port 位置对形态（nc 10.0.0.5 8080、telnet host 25）——紧随
+	// 裸 host 目标之后的合法端口数字认领为该目标的端口。
+	portPair bool
+	// extraSkip: 该工具特有的「下一 token 是值」旗标。不进全局表以避免跨工具
+	// 冲突（wget -O 有值而 curl -O 无值；hydra -p 是密码不是端口）。
+	extraSkip []string
 }
 
 // specIsKnown 区分「已登记工具」（走 T2 token 级提取）与未知工具（整段 T1）。
@@ -87,10 +92,10 @@ func specIsKnown(s toolSpec) bool {
 
 var commandTools = map[string]toolSpec{
 	"curl":        {positional: true},
-	"wget":        {positional: true},
-	"nc":          {positional: true},
-	"ncat":        {positional: true},
-	"netcat":      {positional: true},
+	"wget":        {positional: true, extraSkip: []string{"-O", "--output-document"}},
+	"nc":          {positional: true, portFlag: true, portPair: true},
+	"ncat":        {positional: true, portFlag: true, portPair: true},
+	"netcat":      {positional: true, portFlag: true, portPair: true},
 	"socat":       {positional: true},
 	"openssl":     {positional: true},
 	"ping":        {positional: true},
@@ -108,7 +113,7 @@ var commandTools = map[string]toolSpec{
 	"nikto":       {positional: true, hostFlag: true, portFlag: true},
 	"whatweb":     {positional: true},
 	"dirb":        {positional: true},
-	"hydra":       {positional: true},
+	"hydra":       {positional: true, extraSkip: []string{"-l", "-L", "-p", "-P", "-f", "-t", "-W", "--pass"}},
 	"medusa":      {positional: true, hostFlag: true},
 	"testssl.sh":  {positional: true},
 	"sslscan":     {positional: true},
@@ -121,9 +126,9 @@ var commandTools = map[string]toolSpec{
 	"nuclei":      {positional: true, urlFlag: true},
 	"enum4linux":  {positional: true},
 	"smbclient":   {positional: true},
-	"telnet":      {positional: true},
+	"telnet":      {positional: true, portPair: true},
 	"ssh":         {positional: true},
-	"ftp":         {positional: true},
+	"ftp":         {positional: true, portPair: true},
 }
 
 // skipNextFlags 是「下一 token 是值、不是目标」的旗标。短旗标按前缀匹配
@@ -136,6 +141,9 @@ var skipNextFlags = []string{
 	"-H", "--header", "-d", "--data", "--data-raw", "--data-binary",
 	"-l", "--list", "-iL", "--url-file", "-x", "--proxy", "-e", "--interface",
 	"--auth", "--auth-file", "--ca-file", "--header-file",
+	"-X", "--request",
+	"--script", "--script-args", "--script-args-file",
+	"--exclude", "--excludefile", "--resume",
 }
 
 // ExtractTargets 按工具名从 PreToolUse 的 input JSON 里提取目标。
@@ -171,12 +179,12 @@ func ExtractTargets(toolName string, input json.RawMessage) []Target {
 	return ExtractCommandTargets(text)
 }
 
-// ExtractCommandTargets 从一条 shell 命令里提取目标：先按 | / && / ; / 换行分段，
-// 已知工具走 T2（token 级，旗标值不误判），未知工具整段走 T1（高置信正则兜底）。
+// ExtractCommandTargets 从一条 shell 命令里提取目标：先按 | / && / ; / 换行分段
+// （引号内的分隔符不切段，防 curl 'http://x/a|b' 被腰斩），已知工具走 T2
+// （token 级，旗标值不误判），未知工具整段走 T1（高置信正则兜底）。
 func ExtractCommandTargets(cmd string) []Target {
 	var out []Target
-	repl := strings.NewReplacer("&&", "\n", "||", "\n", "|", "\n", ";", "\n")
-	for _, seg := range strings.Split(repl.Replace(cmd), "\n") {
+	for _, seg := range splitSegments(cmd) {
 		seg = strings.TrimSpace(seg)
 		if seg == "" {
 			continue
@@ -184,6 +192,92 @@ func ExtractCommandTargets(cmd string) []Target {
 		out = append(out, extractSegmentTargets(seg)...)
 	}
 	return dedupe(out)
+}
+
+// splitSegments 按引号外的 | / && / || / ; / 换行切段。单独 &（后台）维持不切段。
+func splitSegments(cmd string) []string {
+	var segs []string
+	var cur strings.Builder
+	var inSingle, inDouble bool
+	runes := []rune(cmd)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case inSingle:
+			if r == '\'' {
+				inSingle = false
+			}
+			cur.WriteRune(r)
+		case inDouble:
+			if r == '"' {
+				inDouble = false
+			}
+			cur.WriteRune(r)
+		case r == '\'':
+			inSingle = true
+			cur.WriteRune(r)
+		case r == '"':
+			inDouble = true
+			cur.WriteRune(r)
+		case r == '|' || r == ';' || r == '\n':
+			segs = append(segs, cur.String())
+			cur.Reset()
+			if i+1 < len(runes) && runes[i+1] == r && r != '\n' {
+				i++ // 吞掉 || / ;; 的第二个字符
+			}
+		case r == '&':
+			// && 是分隔符；单独 &（后台）维持不切段。
+			if i+1 < len(runes) && runes[i+1] == '&' {
+				segs = append(segs, cur.String())
+				cur.Reset()
+				i++
+			} else {
+				cur.WriteRune(r)
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	return append(segs, cur.String())
+}
+
+// tokenizeSegment 按引号外空白切 token：引号内的空格不切分，引号字符保留在
+// token 里（stripQuotes 依赖成对引号剥壳）。strings.Fields 不感知引号，会把
+// 'Content-Type: application/json' 撕成两半、让 -H 只吃到前一半，剩下一半
+// 落成孤立位置参数被误当目标。
+func tokenizeSegment(seg string) []string {
+	var toks []string
+	var cur strings.Builder
+	var inSingle, inDouble bool
+	flush := func() {
+		if cur.Len() > 0 {
+			toks = append(toks, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range seg {
+		switch {
+		case inSingle:
+			if r == '\'' {
+				inSingle = false
+			}
+			cur.WriteRune(r)
+		case inDouble:
+			if r == '"' {
+				inDouble = false
+			}
+			cur.WriteRune(r)
+		case r == '\'' || r == '"':
+			inSingle, inDouble = r == '\'', r == '"'
+			cur.WriteRune(r)
+		case r == ' ' || r == '\t' || r == '\r':
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return toks
 }
 
 // segmentState 记录一段命令内的提取状态。
@@ -195,7 +289,7 @@ type segmentState struct {
 
 // extractSegmentTargets 提取单段命令的目标。
 func extractSegmentTargets(seg string) []Target {
-	toks := strings.Fields(seg)
+	toks := tokenizeSegment(seg)
 	if len(toks) == 0 {
 		return nil
 	}
@@ -216,6 +310,16 @@ func extractSegmentTargets(seg string) []Target {
 			}
 			if t, ok := classifyArg(tok, st); ok {
 				out = append(out, t)
+				continue
+			}
+			// host port 位置对：nc/telnet 等的目标后紧跟合法端口数字 → 认领为
+			// 该目标的端口（数字 token 本身 classifyArg 必拒，不会重复计目标）。
+			if st.spec.portPair && len(out) > 0 && isAllDigits(tok) {
+				if last := &out[len(out)-1]; last.Port == "" && last.Host != "" {
+					if _, _, err := parsePortRange(tok); err == nil {
+						last.Port = tok
+					}
+				}
 			}
 		}
 		// 多端口扫描工具的端口语义回填：无 -p → 范围未知（保守按全端口 "*"）；
@@ -332,6 +436,14 @@ func handleFlag(tok string, toks []string, i int, st *segmentState, out *[]Targe
 		if tok == f || (strings.HasPrefix(tok, f) && !strings.HasPrefix(tok, "--")) {
 			if attached != "" {
 				return 0 // -oGxxx 之类附值已内联
+			}
+			return 1
+		}
+	}
+	for _, f := range st.spec.extraSkip {
+		if tok == f || (strings.HasPrefix(tok, f) && !strings.HasPrefix(tok, "--")) {
+			if attached != "" {
+				return 0
 			}
 			return 1
 		}
@@ -483,6 +595,11 @@ func looksLikeHost(s string) bool {
 	if !hasLetter {
 		return false
 	}
+	// 纯字母全大写裸词（POST/GET/JSON 等常量风格 token）不是常规主机名：未知值
+	// 旗标泄漏为位置参数时（curl -X POST）防止误提取。含数字的（web01/PC-01）不受影响。
+	if !strings.Contains(s, ".") && !strings.ContainsAny(s, "0123456789") && s == strings.ToUpper(s) {
+		return false
+	}
 	if i := strings.LastIndex(s, "."); i >= 0 {
 		if !tlds[strings.ToLower(s[i+1:])] {
 			return false
@@ -545,9 +662,11 @@ func extractTextTargets(text string) []Target {
 	}
 	// 裸 IPv4：仅在文本带目标语境（已提取到其他目标，或出现已知工具名）时提取，
 	// 避免把普通文本里的版本号/数字误当目标；已被 URL/host:port 覆盖的主机不重复提取
-	//（同一主机拆出「无端口」候选会让白名单方向无法证明包含而误拒）。
+	//（同一主机拆出「无端口」候选会让白名单方向无法证明包含而误拒）。紧邻的
+	// 逗号分隔数字（host, port = "10.0.0.5", 9001）认领为端口。
 	if len(out) > 0 || hasContextHint(text) {
-		for _, m := range reIPv4.FindAllString(text, -1) {
+		for _, loc := range reIPv4.FindAllStringIndex(text, -1) {
+			m := text[loc[0]:loc[1]]
 			if net.ParseIP(m) == nil {
 				continue
 			}
@@ -559,11 +678,31 @@ func extractTextTargets(text string) []Target {
 				}
 			}
 			if !dup {
-				add(Target{Host: m, Raw: m})
+				add(Target{Host: m, Port: adjacentPort(text[loc[1]:]), Raw: m})
 			}
 		}
 	}
 	return dedupe(out)
+}
+
+// reAdjacentPort 认领 IP 后「引号/括号 + 逗号 + 数字」形态的端口：Python/JS 里
+// host, port = "10.0.0.5", 9001、connect(("10.0.0.5", 9001))、"10.0.0.5",9001。
+// 只认逗号分隔形态——任意文本里的裸空格数字误当端口的风险太大。
+var reAdjacentPort = regexp.MustCompile(`^['")\]\}]{0,2}\s*,\s*(\d{1,5})\b`)
+
+// adjacentPort 在 IP 匹配结束后的文本片段里找相邻端口；非法端口范围不认领
+// （保持无端口候选，由白名单方向照常判定）。
+func adjacentPort(rest string) string {
+	window := rest
+	if len(window) > 16 {
+		window = window[:16]
+	}
+	if m := reAdjacentPort.FindStringSubmatch(window); m != nil {
+		if _, _, err := parsePortRange(m[1]); err == nil {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 // hasContextHint 判断文本里是否有目标语境（已知工具名出现）。
@@ -664,69 +803,92 @@ func gateTargetsOf(t Target) db.GateTargets {
 	return g
 }
 
-// CheckTargetsForTask 对提取出的目标执行任务白名单判定。
-// taskID<=0 / 无启用规则 → 放行（零开销短路）；规则读取失败 → 放行
-// （fail-open，与 insert_assets 资产闸门一致）。denied 时 denyReason 以
-// [任务白名单] 开头（interceptSource 据此归因为规则来源），包含被拒目标、
-// 当前启用的允许规则列表与引导语，供 agent 自我改写。
-func CheckTargetsForTask(as *db.AssetStore, taskID int64, targets []Target) (denyReason string, denied bool, err error) {
-	if taskID <= 0 || as == nil || len(targets) == 0 {
-		return "", false, nil
-	}
-	block, allow, err := as.LoadTaskGateRules(taskID)
-	if err != nil {
-		// 规则读取失败不阻断（防误伤优先），与 agent/tools_insert.go 的闸门同策略。
-		slog.Debug("guard: 任务白名单规则读取失败，放行", "taskID", taskID, "err", err)
-		return "", false, nil
-	}
-	reason, denied := checkTargetsOnRules(block, allow, targets)
-	return reason, denied, nil
+// gateVerdict 是一次白名单判定的结构化结果：blockHit 与 allowDenied 区分两类
+// 拒绝来源——block 规则是用户显式配置，命中即确定性拦截（不经模型）；allow
+// 越界则交给模型复核终审（见 guard.gateCheck）。
+type gateVerdict struct {
+	blockHit    bool
+	allowDenied bool
+	denyReason  string // 原始拒绝理由（[任务白名单] 前缀，interceptSource 据此归因）
+	suspected   string // 被拒目标清单（模型复核提示词的提取器线索）
 }
 
-// checkTargetsOnRules 是判定核心：对预载入的 block/allow 规则集逐目标评估。
-// 任一目标被拒即拒。规则集为空（无 block 且无启用 allow）→ 放行。
-func checkTargetsOnRules(block, allow []db.AssetInterceptRule, targets []Target) (denyReason string, denied bool) {
+// deniedTarget 是一个被拒目标及其可读原因。
+type deniedTarget struct {
+	display string
+	reason  string
+}
+
+// checkTargetsOnRules 是判定核心：对预载入的 block/allow 规则集逐目标评估，
+// 两遍评估分离拒绝来源（block-only 重叠语义 / allow-only 包含语义，
+// EvaluateAssetGateOn 的合并结果无法区分两类拒绝）。任一目标被拒即拒。
+func checkTargetsOnRules(block, allow []db.AssetInterceptRule, targets []Target) gateVerdict {
 	if len(targets) == 0 || (len(block) == 0 && !db.HasEnabledRule(allow)) {
-		return "", false
+		return gateVerdict{}
 	}
-	type deniedItem struct {
-		display string
-		reason  string
-	}
-	var items []deniedItem
+	var blockItems, allowItems []deniedTarget
 	for _, t := range targets {
-		if d := db.EvaluateAssetGateOn(block, allow, gateTargetsOf(t)); !d.Allowed {
-			items = append(items, deniedItem{display: t.display(), reason: d.Reason})
+		g := gateTargetsOf(t)
+		if d := db.EvaluateAssetGateOn(block, nil, g); !d.Allowed {
+			blockItems = append(blockItems, deniedTarget{t.display(), d.Reason})
+			continue
+		}
+		if d := db.EvaluateAssetGateOn(nil, allow, g); !d.Allowed {
+			allowItems = append(allowItems, deniedTarget{t.display(), d.Reason})
 		}
 	}
-	if len(items) == 0 {
-		return "", false
+	switch {
+	case len(blockItems) > 0:
+		return gateVerdict{blockHit: true,
+			denyReason: joinDenyReason("以下目标命中拦截规则，禁止访问：", blockItems,
+				"。拦截规则为显式配置，直接拦截；请更换目标，或联系管理员调整拦截规则。"),
+			suspected: suspectedOf(blockItems),
+		}
+	case len(allowItems) > 0:
+		var tail string
+		if db.HasEnabledRule(allow) {
+			tail = "。当前启用的允许规则："
+			first := true
+			for _, r := range allow {
+				if !r.Enabled {
+					continue
+				}
+				if !first {
+					tail += "、"
+				}
+				first = false
+				tail += "[" + db.AssetInterceptKindLabel(r.Kind) + "] " + r.Pattern
+			}
+			tail += "。请改写命令，使其只访问白名单内的主机与端口" +
+				"（端口扫描请显式加 -p 指定允许的端口），或联系管理员调整任务的允许规则。"
+		} else {
+			tail = "。本次任务未启用允许规则白名单，命中了上述拦截规则；请更换目标或联系管理员。"
+		}
+		return gateVerdict{allowDenied: true,
+			denyReason: joinDenyReason("以下目标不在本次任务允许范围内，禁止访问：", allowItems, tail),
+			suspected:  suspectedOf(allowItems),
+		}
 	}
+	return gateVerdict{}
+}
+
+func joinDenyReason(head string, items []deniedTarget, tail string) string {
 	var b strings.Builder
-	b.WriteString("[任务白名单] 以下目标不在本次任务允许范围内，禁止访问：")
+	b.WriteString("[任务白名单] " + head)
 	for i, it := range items {
 		if i > 0 {
 			b.WriteString("；")
 		}
 		b.WriteString(it.display + "（" + it.reason + "）")
 	}
-	if db.HasEnabledRule(allow) {
-		b.WriteString("。当前启用的允许规则：")
-		first := true
-		for _, r := range allow {
-			if !r.Enabled {
-				continue
-			}
-			if !first {
-				b.WriteString("、")
-			}
-			first = false
-			b.WriteString("[" + db.AssetInterceptKindLabel(r.Kind) + "] " + r.Pattern)
-		}
-		b.WriteString("。请改写命令，使其只访问白名单内的主机与端口" +
-			"（端口扫描请显式加 -p 指定允许的端口），或联系管理员调整任务的允许规则。")
-	} else {
-		b.WriteString("。本次任务未启用允许规则白名单，命中了上述拦截规则；请更换目标或联系管理员。")
+	b.WriteString(tail)
+	return b.String()
+}
+
+func suspectedOf(items []deniedTarget) string {
+	parts := make([]string, len(items))
+	for i, it := range items {
+		parts[i] = it.display
 	}
-	return b.String(), true
+	return strings.Join(parts, "；")
 }

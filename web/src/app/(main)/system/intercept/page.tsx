@@ -203,6 +203,7 @@ const defaultJudge = (): JudgeConfig => ({
   fail_action: "allow",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
+  task_whitelist_enabled: true,
 });
 
 function JudgeCard() {
@@ -295,6 +296,27 @@ function JudgeCard() {
         <div className="flex shrink-0 items-center gap-2">
           <span className="text-xs text-muted-foreground">{cfg.enabled ? "已启用" : "未启用"}</span>
           <Switch checked={cfg.enabled} disabled={loading} onCheckedChange={(v) => patch({ enabled: v })} />
+        </div>
+      </div>
+
+      {/* 任务白名单复核开关 —— 独立于兜底审批：提取器判疑似越界时由模型终审 */}
+      <div
+        className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-3 ${
+          cfg.task_whitelist_enabled ? "border-emerald-400/50 bg-emerald-50/40 dark:bg-emerald-950/20" : "bg-muted/40"
+        }`}
+      >
+        <div className="flex items-center gap-2.5">
+          <BotIcon className={`h-5 w-5 shrink-0 ${cfg.task_whitelist_enabled ? "text-emerald-600" : "text-muted-foreground"}`} />
+          <div>
+            <p className="text-sm font-semibold leading-tight">任务白名单复核</p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              <span className="font-medium text-foreground">目标提取器</span>判疑似越界时，由模型通读整条命令终审是否落在白名单内（block 拦截规则仍确定性生效）；复核不可用时放行。复用上方审批模型与超时，独立于兜底审批开关
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="text-xs text-muted-foreground">{cfg.task_whitelist_enabled ? "已启用" : "未启用"}</span>
+          <Switch checked={cfg.task_whitelist_enabled} disabled={loading} onCheckedChange={(v) => patch({ task_whitelist_enabled: v })} />
         </div>
       </div>
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestParseVerdict(t *testing.T) {
@@ -71,5 +73,46 @@ func TestParseVerdictKeepsCompleteChineseExplanation(t *testing.T) {
 	raw, _ = json.Marshal(map[string]string{"decision": "allow", "comment": strings.Repeat("中", 2401)})
 	if got := ParseVerdict(string(raw)); got.Action != "" {
 		t.Fatal("accepted unbounded explanation")
+	}
+}
+
+func TestTaskWhitelistJudgePrompt(t *testing.T) {
+	allow := []db.AssetInterceptRule{
+		{Kind: "host_port", Pattern: "10.10.5.238:9001", Enabled: true},
+		{Kind: "host_port", Pattern: "10.10.5.238:8443", Enabled: false}, // 未启用不列出
+	}
+	block := []db.AssetInterceptRule{{Kind: "fuzzy_domain", Pattern: ".gov.cn", Enabled: true}}
+	prompt := TaskWhitelistJudgePrompt(block, allow, "10.9.9.9")
+
+	// 启用的允许规则逐条编号；未启用的不进清单。
+	if !strings.Contains(prompt, "- WL-1 [主机+端口] 10.10.5.238:9001") {
+		t.Fatalf("提示词应含编号化的启用允许规则: %s", prompt)
+	}
+	if strings.Contains(prompt, "8443") {
+		t.Fatalf("未启用的规则不应进清单: %s", prompt)
+	}
+	if !strings.Contains(prompt, "- BLK-1 [域名(模糊)] .gov.cn") {
+		t.Fatalf("提示词应含编号化的拦截规则: %s", prompt)
+	}
+	if !strings.Contains(prompt, "提取器线索") || !strings.Contains(prompt, "10.9.9.9") {
+		t.Fatalf("提示词应含提取器疑似越界线索: %s", prompt)
+	}
+	// 信封与输出协议由 EffectiveJudgePrompt 追加，白名单口径覆盖在其后。
+	if !strings.Contains(prompt, JudgeContextBoundary) || !strings.Contains(prompt, JudgeOutputContract) {
+		t.Fatalf("提示词应含输入信任边界与输出协议")
+	}
+	if !strings.Contains(prompt, taskWhitelistOverride) {
+		t.Fatalf("提示词应含白名单口径覆盖")
+	}
+	if !strings.Contains(prompt, "不得默认放行") {
+		t.Fatalf("口径覆盖应要求判不准转 ask 而非默认放行")
+	}
+	// 无允许规则时不产 WL 编号。
+	empty := TaskWhitelistJudgePrompt(nil, nil, "")
+	if !strings.Contains(empty, "（未启用允许规则）") {
+		t.Fatalf("空白名单应有明确说明: %s", empty)
+	}
+	if strings.Contains(empty, "WL-1") {
+		t.Fatalf("空白名单不应产出 WL 编号: %s", empty)
 	}
 }

@@ -332,9 +332,11 @@ func ensureSchema(raw json.RawMessage) map[string]any {
 
 // gateTargets 对自定义工具渲染后的目标做任务白名单校验。自定义工具不走 guard 的
 // PreToolUse 闸门（PreToolUse 只有参数 JSON、拿不到渲染后的 URL/命令），且工具名
-// 不是 Bash/WebFetch，因此必须在渲染后于此处拦。taskID 取自 RunInfo；调试端点
-// （pgTestCustomTool）无 RunInfo、taskID=0，天然跳过。
-func (s *Server) gateTargets(ctx context.Context, targets []guard.Target) error {
+// 不是 Bash/WebFetch，因此必须在渲染后于此处拦。与 Bash 闸门同一 gateCheck 核心：
+// block 规则确定性拦截；allow 越界交模型复核终审；复核不可用放行（fail-open）。
+// judgeInput 是渲染后的完整参数（供模型复核读取真实目标）。taskID 取自 RunInfo；
+// 调试端点（pgTestCustomTool）无 RunInfo、taskID=0，天然跳过。
+func (s *Server) gateTargets(ctx context.Context, toolName string, judgeInput json.RawMessage, targets []guard.Target) error {
 	if len(targets) == 0 {
 		return nil
 	}
@@ -342,11 +344,12 @@ func (s *Server) gateTargets(ctx context.Context, targets []guard.Target) error 
 	if ri.TaskID <= 0 {
 		return nil
 	}
-	reason, denied, err := guard.CheckTargetsForTask(s.m.Assets(), ri.TaskID, targets)
-	if err != nil || !denied {
-		return nil // fail-open 与 guard 闸门一致
+	g := guard.NewForTask(s.m.interceptor, ri.TaskID, s.m.Assets())
+	reason, denied := g.CheckAllowedTargets(ctx, toolName, judgeInput, targets)
+	if !denied {
+		return nil
 	}
-	return fmt.Errorf("%s", reason)
+	return fmt.Errorf("%s", guard.SystemBlockMessage(reason))
 }
 
 func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
@@ -356,7 +359,8 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 		return actool.Errorf("command 为空"), nil
 	}
 	cmd := renderTemplate(spec.Command, params, shellQuote)
-	if err := s.gateTargets(ctx, guard.ExtractCommandTargets(cmd)); err != nil {
+	gateInput, _ := json.Marshal(map[string]any{"command": cmd})
+	if err := s.gateTargets(ctx, "Bash", gateInput, guard.ExtractCommandTargets(cmd)); err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
@@ -383,12 +387,13 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 		return actool.Errorf("未配置且未检测到 python 解释器(在系统配置里设置)"), nil
 	}
 	// 脚本在解释器里直连目标，guard 看不见；对代码+参数做 T1 级提取后校验
-	// （提不出就放行，与其他闸门的口径一致）。
+	// （提不出就放行，与其他闸门的口径一致）；模型复核读取完整代码与参数。
 	gateText := spec.Code
 	if b, err := json.Marshal(params); err == nil {
 		gateText += "\n" + string(b)
 	}
-	if err := s.gateTargets(ctx, guard.ExtractTextTargets(gateText)); err != nil {
+	gateInput, _ := json.Marshal(map[string]any{"code": spec.Code, "params": params})
+	if err := s.gateTargets(ctx, key, gateInput, guard.ExtractTextTargets(gateText)); err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
 	workDir := s.m.dir
@@ -462,7 +467,8 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		return actool.Errorf("http url 为空"), nil
 	}
 	if t, ok := guard.ExtractURLTarget(rawURL); ok {
-		if err := s.gateTargets(ctx, []guard.Target{t}); err != nil {
+		gateInput, _ := json.Marshal(map[string]any{"url": rawURL, "method": method})
+		if err := s.gateTargets(ctx, "WebFetch", gateInput, []guard.Target{t}); err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
 	}

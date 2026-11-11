@@ -64,6 +64,22 @@ func TestExtractCommandTargets(t *testing.T) {
 		{"shell 变量引用提不出", "curl \"$TARGET\"", "(none)"},
 		{"引号包裹的目标", "curl 'http://10.8.8.8:7070/'", "10.8.8.8|7070"},
 		{"文件输出重定向目标不误报", "nmap -oG out.txt -p 80 10.3.3.3", "10.3.3.3|80"},
+		// --- 误报修复回归（2026-11-11 线上两次误拦）---
+		{"curl -X POST 方法旗标值不是目标", "curl -s -m 10 -i -X POST http://10.9.9.9/x", "10.9.9.9|80"},
+		{"引号内空格的头是整体不是孤立词", "curl -H 'Accept: application' http://10.9.9.9/", "10.9.9.9|80"},
+		{"引号内管道不切段", "curl 'http://10.8.8.8:7070/a|b'", "10.8.8.8|7070"},
+		{"nmap --script 脚本名不是目标", "nmap --script http-vuln-cve2017-5638 -p 8080 10.3.3.3", "10.3.3.3|8080"},
+		{"nmap --script-args 值不是目标", "nmap --script-args 'a=1,b=2' -p 443 10.3.3.3", "10.3.3.3|443"},
+		{"nc host port 位置对", "nc 10.3.3.3 8080", "10.3.3.3|8080"},
+		{"nc -p 端口前缀", "nc -p 8080 10.3.3.3", "10.3.3.3|8080"},
+		{"telnet host port 位置对", "telnet 10.3.3.3 25", "10.3.3.3|25"},
+		{"wget -O 无扩展名输出文件不是目标", "wget -O out https://example.com/page", "example.com|443"},
+		{"hydra -p 密码旗标值不是目标", "hydra -l admin -p pass123 10.3.3.3", "10.3.3.3|"},
+		{"全大写常量词不是主机", "curl --retry-max-time POST http://10.9.9.9/", "10.9.9.9|80"},
+		// --- 相邻端口合成（heredoc/脚本源码形态；T1 裸 IP 需目标语境才提取）---
+		{"Python 赋值 IP 后逗号端口", `host, port = "10.10.5.238", 9001`, "10.10.5.238|9001"},
+		{"函数调用元组 IP 后逗号端口", `func_call(("10.0.0.5", 9090))`, "10.0.0.5|9090"},
+		{"非法端口范围不合成", `host, port = "10.0.0.5", 70000`, "10.0.0.5|"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
