@@ -251,6 +251,11 @@ func interceptSource(ruleID int64, reason string) string {
 	if strings.HasPrefix(reason, "[模型]") {
 		return "model"
 	}
+	// guard 的任务白名单闸门不关联 intercept_rules 行（规则在 task_intercept_rules），
+	// 约定 denyReason 以 [任务白名单] 前缀标识规则来源。
+	if strings.HasPrefix(reason, "[任务白名单]") {
+		return "rule"
+	}
 	return "unknown"
 }
 

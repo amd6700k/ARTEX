@@ -3748,6 +3748,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				rec.MainSeg = segPtr
 				s.engine.emitActivity(t, rec)
 			}
+			// 挂任务上下文：mainagent 的 guard hooks（拦截/白名单）审计归到本任务。
+			ctx = intercept.WithTaskContext(ctx, t.ID, "mainagent", nil)
 			maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 			resume := func() { s.reviveTask(t) } // set_goals 新增目标 → 把任务拉回 running
 			// 把上传附件的【绝对路径】清单拼进发给 agent 的消息,它据此用 Read/Bash 打开文件。
@@ -3755,7 +3757,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint, taskHooks(t))
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})

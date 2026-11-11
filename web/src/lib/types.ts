@@ -1279,7 +1279,8 @@ export type AssetInterceptKind =
   | "fuzzy_domain"
   | "fuzzy_ip"
   | "fuzzy_url"
-  | "cidr";
+  | "cidr"
+  | "host_port";
 
 // action 仅用于任务级规则：block=拦截(禁止测试) allow=允许(白名单)。
 export type AssetInterceptAction = "block" | "allow";

@@ -149,6 +149,10 @@ func validateAssetInterceptRuleReq(req *assetInterceptRuleReq) error {
 		if _, _, err := net.ParseCIDR(req.Pattern); err != nil {
 			return fmt.Errorf("cidr 不是有效网段（形如 192.168.0.0/16）：%s", req.Pattern)
 		}
+	case "host_port":
+		if _, _, _, err := db.ParseHostPortPattern(req.Pattern); err != nil {
+			return fmt.Errorf("host_port 不是有效的主机+端口（形如 203.0.113.10:8080 / 10.0.0.1:8000-9000 / 192.168.0.0/16:443）：%s", req.Pattern)
+		}
 	default:
 		return fmt.Errorf("kind 无效：%s", req.Kind)
 	}

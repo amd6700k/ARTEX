@@ -10,10 +10,12 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"regexp"
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/hook"
 )
@@ -34,6 +36,12 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+
+	// 任务白名单闸门（applyAssetGate）：taskID>0 且 assets/rulesFn 至少其一非 nil
+	// 时启用。assets 走真实规则装载；rulesFn 是测试缝（注入静态规则，无需 PG）。
+	taskID  int64
+	assets  *db.AssetStore
+	rulesFn func() (block, allow []db.AssetInterceptRule, err error)
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -42,6 +50,15 @@ func New() *Guard { return newGuard(nil) }
 
 // NewWithInterceptor creates a Guard with user-configured intercept rules.
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
+
+// NewForTask creates a Guard with both the intercept rules and the per-task
+// asset whitelist gate (applyAssetGate) enabled.
+func NewForTask(ic *intercept.Interceptor, taskID int64, as *db.AssetStore) *Guard {
+	g := newGuard(ic)
+	g.taskID = taskID
+	g.assets = as
+	return g
+}
 
 func newGuard(ic *intercept.Interceptor) *Guard {
 	g := &Guard{attrib: map[string]int{}, interceptor: ic}
@@ -75,7 +92,63 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		cmd = in.Text
 	}
 	g.record(ev.ToolName, "allow", "", cmd)
+	if res := g.applyAssetGate(ctx, ev, cmd); res.Decision == "block" {
+		return res
+	}
 	return g.applyIntercept(ctx, ev)
+}
+
+// gateTools 是任务白名单闸门作用的工具集合。只拦真正外发流量的工具，不做
+// 全工具文本扫 URL——record_fact/report_finding 之类文本工具的 evidence 里
+// 出现域外 URL 不应被误拦。
+var gateTools = map[string]bool{
+	"Bash":       true,
+	"WebFetch":   true,
+	"shell_open": true,
+	"shell_send": true,
+}
+
+// applyAssetGate 是任务级目标白名单闸门：从工具入参提取测试目标，逐个跑
+// 任务允许/拦截规则（EvaluateAssetGateOn）。定位是防误伤的策略闸门：
+//   - taskID<=0（顶层 chat 等）或 assets/rulesFn 均未设 → 放行（闸门关闭）；
+//   - 规则读取失败 → 放行（fail-open，与 insert_assets 资产闸门一致）；
+//   - 无启用规则 → 放行且不提取目标（零开销短路）；
+//   - 提取不到目标 → 放行（记 debug 日志，仅在白名单启用时走到这里）。
+func (g *Guard) applyAssetGate(ctx context.Context, ev hook.Event, cmd string) hook.Result {
+	if g.taskID <= 0 || (!gateTools[ev.ToolName]) {
+		return hook.Result{}
+	}
+	if g.rulesFn == nil && g.assets == nil {
+		return hook.Result{}
+	}
+	var block, allow []db.AssetInterceptRule
+	var err error
+	if g.rulesFn != nil {
+		block, allow, err = g.rulesFn()
+	} else {
+		block, allow, err = g.assets.LoadTaskGateRules(g.taskID)
+	}
+	if err != nil {
+		slog.Debug("guard: 任务白名单规则读取失败，放行", "taskID", g.taskID, "err", err)
+		return hook.Result{}
+	}
+	if len(block) == 0 && !db.HasEnabledRule(allow) {
+		return hook.Result{} // 未启用白名单/拦截：不提取目标，零开销
+	}
+	targets := ExtractTargets(ev.ToolName, ev.Input)
+	if len(targets) == 0 {
+		slog.Debug("guard: 白名单启用但未提取到目标，放行", "taskID", g.taskID, "tool", ev.ToolName)
+		return hook.Result{}
+	}
+	reason, denied := checkTargetsOnRules(block, allow, targets)
+	if !denied {
+		return hook.Result{}
+	}
+	if g.interceptor != nil {
+		dec := intercept.Decision{Action: "deny", Message: reason}
+		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
+	}
+	return g.block(ev.ToolName, systemBlockMessage(reason), cmd)
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.

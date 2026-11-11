@@ -586,6 +586,16 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 	return false, "", nil
 }
 
+// taskHooks 返回任务 Guard 的 hook 注册表，供 planner/mainagent 这类此前未挂
+// hooks 的会话使用（命令拦截 + 任务白名单闸门）。Guard 未初始化时返回 nil，
+// 保持会话不受门控。
+func taskHooks(t *Task) harness.HookRunner {
+	if t == nil || t.Guard == nil {
+		return nil
+	}
+	return t.Guard.Hooks()
+}
+
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
@@ -864,6 +874,8 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+		// 挂任务上下文：planner 的 guard hooks（拦截/白名单）落库审计归到本任务。
+		ectx = intercept.WithTaskContext(ectx, t.ID, "planner", emit)
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
@@ -877,7 +889,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit, taskHooks(t))
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:

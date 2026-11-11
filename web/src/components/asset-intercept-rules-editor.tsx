@@ -23,6 +23,11 @@ export const ASSET_INTERCEPT_KIND_OPTIONS: {
   { value: "fuzzy_ip", label: "IP(模糊)", placeholder: "203.0.113." },
   { value: "fuzzy_url", label: "URL(模糊)", placeholder: "/admin" },
   { value: "cidr", label: "CIDR 网段", placeholder: "192.168.0.0/16" },
+  {
+    value: "host_port",
+    label: "主机+端口",
+    placeholder: "203.0.113.10:8080 / 192.168.0.0/16:443 / 10.0.0.1:8000-9000",
+  },
 ];
 
 // AssetInterceptRulesEditor 是「拦截/允许规则」的受控多行编辑区（拦截block/允许allow +

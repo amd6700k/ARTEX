@@ -7,6 +7,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -109,7 +110,10 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 // non-nil, receives each execution step (thinking / tool_use / tool_result /
 // text / result) so the main-agent session shows its work — exactly like the
 // worker/planner sessions — not just the final answer.
-func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
+// hooks, if non-nil, carries the guard's PreToolUse/PostToolUse hooks so command
+// intercept rules and the task asset whitelist apply to the main agent's
+// Bash/WebFetch too (nil keeps the session ungated).
+func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string), hooks harness.HookRunner) (string, error) {
 	tsx := NewToolSet(ts, "human")
 	tsx.SetFindingRecorder(m.findingRecorder)
 	if as != nil {
@@ -172,6 +176,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		if mainSeg > 0 {
 			opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
 		}
+	}
+	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
+		opts.Hooks = hooks
 	}
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	// session id 与 transcript 同规则(分段感知),使归档与恢复对齐。

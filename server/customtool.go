@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -328,6 +330,25 @@ func ensureSchema(raw json.RawMessage) map[string]any {
 
 // ---------- command:渲染命令 → 复用 Bash 底层 run ----------
 
+// gateTargets 对自定义工具渲染后的目标做任务白名单校验。自定义工具不走 guard 的
+// PreToolUse 闸门（PreToolUse 只有参数 JSON、拿不到渲染后的 URL/命令），且工具名
+// 不是 Bash/WebFetch，因此必须在渲染后于此处拦。taskID 取自 RunInfo；调试端点
+// （pgTestCustomTool）无 RunInfo、taskID=0，天然跳过。
+func (s *Server) gateTargets(ctx context.Context, targets []guard.Target) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	ri := agent.RunInfoFrom(ctx)
+	if ri.TaskID <= 0 {
+		return nil
+	}
+	reason, denied, err := guard.CheckTargetsForTask(s.m.Assets(), ri.TaskID, targets)
+	if err != nil || !denied {
+		return nil // fail-open 与 guard 闸门一致
+	}
+	return fmt.Errorf("%s", reason)
+}
+
 func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
 	var spec commandExec
 	_ = json.Unmarshal(execRaw, &spec)
@@ -335,6 +356,9 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 		return actool.Errorf("command 为空"), nil
 	}
 	cmd := renderTemplate(spec.Command, params, shellQuote)
+	if err := s.gateTargets(ctx, guard.ExtractCommandTargets(cmd)); err != nil {
+		return actool.Errorf(err.Error()), nil
+	}
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
 	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
@@ -357,6 +381,15 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	interp := s.pythonInterpreter()
 	if interp == "" {
 		return actool.Errorf("未配置且未检测到 python 解释器(在系统配置里设置)"), nil
+	}
+	// 脚本在解释器里直连目标，guard 看不见；对代码+参数做 T1 级提取后校验
+	// （提不出就放行，与其他闸门的口径一致）。
+	gateText := spec.Code
+	if b, err := json.Marshal(params); err == nil {
+		gateText += "\n" + string(b)
+	}
+	if err := s.gateTargets(ctx, guard.ExtractTextTargets(gateText)); err != nil {
+		return actool.Errorf(err.Error()), nil
 	}
 	workDir := s.m.dir
 	var sessionEnv []string
@@ -427,6 +460,11 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	rawURL := renderTemplate(spec.URL, params, identity)
 	if strings.TrimSpace(rawURL) == "" {
 		return actool.Errorf("http url 为空"), nil
+	}
+	if t, ok := guard.ExtractURLTarget(rawURL); ok {
+		if err := s.gateTargets(ctx, []guard.Target{t}); err != nil {
+			return actool.Errorf(err.Error()), nil
+		}
 	}
 	var bodyReader io.Reader
 	if spec.Body != "" {

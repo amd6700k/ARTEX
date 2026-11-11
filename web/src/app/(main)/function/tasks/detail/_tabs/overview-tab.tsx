@@ -1058,6 +1058,11 @@ const TASK_RULE_KIND_OPTIONS: { value: AssetInterceptKind; label: string; placeh
   { value: "fuzzy_ip", label: "IP(模糊)", placeholder: "203.0.113." },
   { value: "fuzzy_url", label: "URL(模糊)", placeholder: "/admin" },
   { value: "cidr", label: "CIDR 网段", placeholder: "192.168.0.0/16" },
+  {
+    value: "host_port",
+    label: "主机+端口",
+    placeholder: "203.0.113.10:8080 / 192.168.0.0/16:443 / 10.0.0.1:8000-9000",
+  },
 ];
 
 const TASK_RULE_KIND_LABEL: Record<AssetInterceptKind, string> = Object.fromEntries(
@@ -1314,6 +1319,9 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
         ) : (
           <p className="text-muted-foreground text-sm">
             暂无任务级规则。「拦截」命中即禁止测试；「允许」为白名单——配置后本任务只允许命中允许规则的资产（未配置则不启用白名单）。
+            「主机+端口」可精确到端口（如
+            203.0.113.10:8080）：带端口的「允许」只放行显式访问该端口的命令（端口扫描需显式加 -p），不带端口的主机规则 =
+            主机任意端口；纯 host_port 白名单下 ping 等无端口命令需另配裸主机/IP 规则。
           </p>
         )}
       </CardContent>

@@ -29,26 +29,35 @@ const KIND_OPTIONS: { value: AssetInterceptKind; label: string; group: string; p
   { value: "fuzzy_ip", label: "IP（模糊）", group: "模糊匹配", placeholder: "203.0.113." },
   { value: "fuzzy_url", label: "URL（模糊）", group: "模糊匹配", placeholder: "/admin" },
   { value: "cidr", label: "CIDR 网段", group: "网段", placeholder: "192.168.0.0/16" },
+  {
+    value: "host_port",
+    label: "主机+端口",
+    group: "主机+端口",
+    placeholder: "203.0.113.10:8080 / 192.168.0.0/16:443 / 10.0.0.1:8000-9000",
+  },
 ];
 
 const KIND_LABEL: Record<AssetInterceptKind, string> = Object.fromEntries(
   KIND_OPTIONS.map((o) => [o.value, o.label]),
 ) as Record<AssetInterceptKind, string>;
 
-const KIND_GROUPS = ["全等匹配", "模糊匹配", "网段"];
+const KIND_GROUPS = ["全等匹配", "模糊匹配", "网段", "主机+端口"];
 
 function KindBadge({ kind }: { kind: AssetInterceptKind }) {
   const fuzzy = kind.startsWith("fuzzy_");
   const cidr = kind === "cidr";
+  const hostPort = kind === "host_port";
   return (
     <Badge
       variant="outline"
       className={
-        cidr
-          ? "border-sky-400 text-sky-600"
-          : fuzzy
-            ? "border-amber-400 text-amber-600"
-            : "border-emerald-400 text-emerald-600"
+        hostPort
+          ? "border-violet-400 text-violet-600"
+          : cidr
+            ? "border-sky-400 text-sky-600"
+            : fuzzy
+              ? "border-amber-400 text-amber-600"
+              : "border-emerald-400 text-emerald-600"
       }
     >
       {KIND_LABEL[kind]}

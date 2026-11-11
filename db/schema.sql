@@ -1249,10 +1249,11 @@ ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS context_info JSONB N
 -- 独立于 §K 命令拦截(intercept_rules)：intercept_rules 匹配工具名/入参文本，
 -- 这张表匹配「目标资产」——全等/模糊的域名·IP·URL 以及 CIDR 网段。
 -- 仅存规则；具体的匹配/拦截逻辑在别处实现。
--- kind 七种：
+-- kind 八种：
 --   exact_domain / exact_ip / exact_url  —— 全等匹配
 --   fuzzy_domain / fuzzy_ip / fuzzy_url  —— 模糊匹配
 --   cidr                                 —— CIDR 网段
+--   host_port                            —— 主机+端口（host[:port区间]，须带端口）
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS asset_intercept_rules (
     id          BIGSERIAL PRIMARY KEY,
@@ -1260,13 +1261,19 @@ CREATE TABLE IF NOT EXISTS asset_intercept_rules (
     kind        TEXT NOT NULL CHECK (kind IN (
                     'exact_domain', 'exact_ip', 'exact_url',
                     'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
-                    'cidr')),
+                    'cidr', 'host_port')),
     pattern     TEXT NOT NULL,
     note        TEXT NOT NULL DEFAULT '',
     builtin     BOOLEAN NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- 补旧库：kind CHECK 收紧前的旧约束不含 host_port，幂等重建。
+ALTER TABLE asset_intercept_rules DROP CONSTRAINT IF EXISTS asset_intercept_rules_kind_check;
+ALTER TABLE asset_intercept_rules ADD CONSTRAINT asset_intercept_rules_kind_check
+    CHECK (kind IN ('exact_domain', 'exact_ip', 'exact_url',
+                    'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
+                    'cidr', 'host_port'));
 CREATE INDEX IF NOT EXISTS idx_asset_intercept_enabled ON asset_intercept_rules(enabled);
 DROP TRIGGER IF EXISTS trg_asset_intercept_rules_upd ON asset_intercept_rules;
 CREATE TRIGGER trg_asset_intercept_rules_upd BEFORE UPDATE ON asset_intercept_rules
@@ -1288,7 +1295,7 @@ CREATE TABLE IF NOT EXISTS task_intercept_rules (
     kind        TEXT NOT NULL CHECK (kind IN (
                     'exact_domain', 'exact_ip', 'exact_url',
                     'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
-                    'cidr')),
+                    'cidr', 'host_port')),
     pattern     TEXT NOT NULL,
     note        TEXT NOT NULL DEFAULT '',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1297,6 +1304,12 @@ CREATE TABLE IF NOT EXISTS task_intercept_rules (
 CREATE INDEX IF NOT EXISTS idx_task_intercept_task ON task_intercept_rules(task_id);
 -- 补旧库(本会话早前建过该表、无 action 列)：加列(带 IF NOT EXISTS)。
 ALTER TABLE task_intercept_rules ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'block';
+-- 补旧库：kind CHECK 旧约束不含 host_port，幂等重建。
+ALTER TABLE task_intercept_rules DROP CONSTRAINT IF EXISTS task_intercept_rules_kind_check;
+ALTER TABLE task_intercept_rules ADD CONSTRAINT task_intercept_rules_kind_check
+    CHECK (kind IN ('exact_domain', 'exact_ip', 'exact_url',
+                    'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
+                    'cidr', 'host_port'));
 DROP TRIGGER IF EXISTS trg_task_intercept_rules_upd ON task_intercept_rules;
 CREATE TRIGGER trg_task_intercept_rules_upd BEFORE UPDATE ON task_intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

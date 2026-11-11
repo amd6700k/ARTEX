@@ -13,33 +13,74 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// assetInterceptCandidates 提取一条待插入资产输入项的 域名/IP/URL 候选串，用于资产拦截匹配。
-// URL 的 host 会拆出归类，使「只带 URL」的服务/端点资产也能被 域名/IP 规则命中。
-func assetInterceptCandidates(item assetInputItem) (domains, ips, urls []string) {
+// assetInterceptCandidates 提取一条待插入资产输入项的拦截候选集，用于资产拦截匹配。
+// URL 的 host 会拆出归类，使「只带 URL」的服务/端点资产也能被 域名/IP 规则命中；
+// 已知端口（open_ports / URL 显式或按 scheme 默认端口）额外产出 host:port 候选，
+// 使 host_port 白名单规则也能命中该资产。
+func assetInterceptCandidates(item assetInputItem) db.GateTargets {
+	var t db.GateTargets
 	add := func(dst *[]string, s string) {
 		if s = strings.TrimSpace(s); s != "" {
 			*dst = append(*dst, s)
 		}
 	}
-	add(&domains, item.Domain)
-	for _, d := range item.BoundDomains {
-		add(&domains, d)
+	addHost := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, _, err := net.ParseCIDR(h); err == nil {
+			add(&t.CIDRs, h)
+			return
+		}
+		if net.ParseIP(h) != nil {
+			add(&t.IPs, h)
+		} else {
+			add(&t.Domains, h)
+		}
 	}
-	add(&ips, item.IP)
-	add(&ips, item.ServiceIP)
-	add(&urls, item.URL)
-	if item.URL != "" {
-		if u, err := url.Parse(item.URL); err == nil {
-			if h := u.Hostname(); h != "" {
-				if net.ParseIP(h) != nil {
-					add(&ips, h)
-				} else {
-					add(&domains, h)
-				}
+	addHostPort := func(h, port string) {
+		h, port = strings.TrimSpace(h), strings.TrimSpace(port)
+		if h == "" || port == "" {
+			return
+		}
+		add(&t.HostPorts, net.JoinHostPort(h, port))
+	}
+	add(&t.Domains, item.Domain)
+	for _, d := range item.BoundDomains {
+		add(&t.Domains, d)
+	}
+	addHost(item.IP)
+	addHost(item.ServiceIP)
+	for _, ip := range []string{strings.TrimSpace(item.IP), strings.TrimSpace(item.ServiceIP)} {
+		if ip == "" || net.ParseIP(ip) == nil {
+			continue
+		}
+		for _, ps := range item.OpenPorts {
+			if ps.Port > 0 {
+				addHostPort(ip, strconv.Itoa(ps.Port))
 			}
 		}
 	}
-	return domains, ips, urls
+	add(&t.URLs, item.URL)
+	if item.URL != "" {
+		if u, err := url.Parse(item.URL); err == nil {
+			if h := u.Hostname(); h != "" {
+				addHost(h)
+				port := u.Port()
+				if port == "" {
+					switch strings.ToLower(u.Scheme) {
+					case "http":
+						port = "80"
+					case "https":
+						port = "443"
+					}
+				}
+				addHostPort(h, port)
+			}
+		}
+	}
+	return t
 }
 
 // assetInputLabel 返回一条待插入资产的简短标识，用于拦截说明消息。
@@ -229,19 +270,11 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 
 			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
 			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
-			blockRules, _ := t.as.ListAssetInterceptRules()
-			var allowRules []db.AssetInterceptRule
-			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
-				}
-			}
+			blockRules, allowRules, _ := t.as.LoadTaskGateRules(t.taskID)
 
 			for i, item := range a.Assets {
 				// 资产闸门：先拦截后允许，被拒的资产禁止插入（跳过 Upsert 及后续副作用）。
-				domains, ips, urls := assetInterceptCandidates(item)
-				if d := db.EvaluateAssetGate(blockRules, allowRules, domains, ips, urls); !d.Allowed {
+				if d := db.EvaluateAssetGateOn(blockRules, allowRules, assetInterceptCandidates(item)); !d.Allowed {
 					errs = append(errs, errEntry{
 						Index: i,
 						Error: fmt.Sprintf("资产 %s %s，已禁止插入", assetInputLabel(item), d.Reason),

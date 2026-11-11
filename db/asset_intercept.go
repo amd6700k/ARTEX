@@ -9,7 +9,7 @@ import "time"
 type AssetInterceptRule struct {
 	ID        int64     `json:"id"`
 	Enabled   bool      `json:"enabled"`
-	Kind      string    `json:"kind"` // exact_domain|exact_ip|exact_url|fuzzy_domain|fuzzy_ip|fuzzy_url|cidr
+	Kind      string    `json:"kind"` // exact_domain|exact_ip|exact_url|fuzzy_domain|fuzzy_ip|fuzzy_url|cidr|host_port
 	Pattern   string    `json:"pattern"`
 	Note      string    `json:"note"`
 	Builtin   bool      `json:"builtin"`
