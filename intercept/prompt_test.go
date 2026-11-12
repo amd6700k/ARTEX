@@ -82,7 +82,7 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 		{Kind: "host_port", Pattern: "10.10.5.238:8443", Enabled: false}, // 未启用不列出
 	}
 	block := []db.AssetInterceptRule{{Kind: "fuzzy_domain", Pattern: ".gov.cn", Enabled: true}}
-	prompt := TaskWhitelistJudgePrompt(block, allow, "10.9.9.9")
+	prompt := TaskWhitelistJudgePrompt(block, allow)
 
 	// 启用的允许规则逐条编号；未启用的不进清单。
 	if !strings.Contains(prompt, "- WL-1 [主机+端口] 10.10.5.238:9001") {
@@ -94,8 +94,18 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 	if !strings.Contains(prompt, "- BLK-1 [域名(模糊)] .gov.cn") {
 		t.Fatalf("提示词应含编号化的拦截规则: %s", prompt)
 	}
-	if !strings.Contains(prompt, "提取器线索") || !strings.Contains(prompt, "10.9.9.9") {
-		t.Fatalf("提示词应含提取器疑似越界线索: %s", prompt)
+	// 两类流量口径（纯模型判断的核心）：靶标 vs 非靶标联网查询。
+	if !strings.Contains(prompt, "非靶标的合法联网查询") || !strings.Contains(prompt, "默认 allow") {
+		t.Fatalf("提示词应含非靶标查询默认放行口径: %s", prompt)
+	}
+	if !strings.Contains(prompt, "按连接目的地判定，不按查询内容主题判定") {
+		t.Fatalf("提示词应含按目的地判定口径: %s", prompt)
+	}
+	if !strings.Contains(prompt, "对全部流量生效") {
+		t.Fatalf("提示词应声明拦截规则覆盖全部流量: %s", prompt)
+	}
+	if !strings.Contains(prompt, "靶标流量") {
+		t.Fatalf("提示词应含靶标流量概念: %s", prompt)
 	}
 	// 信封与输出协议由 EffectiveJudgePrompt 追加，白名单口径覆盖在其后。
 	if !strings.Contains(prompt, JudgeContextBoundary) || !strings.Contains(prompt, JudgeOutputContract) {
@@ -107,12 +117,18 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 	if !strings.Contains(prompt, "不得默认放行") {
 		t.Fatalf("口径覆盖应要求判不准转 ask 而非默认放行")
 	}
-	// 无允许规则时不产 WL 编号。
-	empty := TaskWhitelistJudgePrompt(nil, nil, "")
+	if !strings.Contains(prompt, "非靶标联网查询") {
+		t.Fatalf("口径覆盖应说明非靶标查询的命中规则填写方式")
+	}
+	// 无允许规则时不产 WL 编号，且只按 BLK 判定。
+	empty := TaskWhitelistJudgePrompt(nil, nil)
 	if !strings.Contains(empty, "（未启用允许规则）") {
 		t.Fatalf("空白名单应有明确说明: %s", empty)
 	}
 	if strings.Contains(empty, "WL-1") {
 		t.Fatalf("空白名单不应产出 WL 编号: %s", empty)
+	}
+	if !strings.Contains(empty, "只按 BLK 拦截规则判定") {
+		t.Fatalf("空白名单应声明只按拦截规则判定: %s", empty)
 	}
 }

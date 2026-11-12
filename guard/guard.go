@@ -5,9 +5,10 @@
 // later.) Destructive/exfil gating is no longer hard-coded here — it lives in the
 // DB intercept rules (seeded as ordinary [内置] rules, so users can disable or
 // delete them), evaluated via applyIntercept. The per-task asset whitelist gate
-// (applyAssetGate) uses regex target extraction only as a cheap trigger: an
-// allow-list denial is referred to the LLM whitelist review (JudgeTaskWhitelist)
-// for the final verdict — block-rule hits stay deterministic.
+// (applyAssetGate) is pure-model: calls with network signals are referred to the
+// LLM whitelist review (JudgeTaskWhitelist) which judges real destinations as
+// either in-scope target traffic or legitimate non-target lookups; a loose
+// network-signal prefilter only decides whether to spend a model call.
 package guard
 
 import (
@@ -119,13 +120,50 @@ var gateTools = map[string]bool{
 	"shell_send": true,
 }
 
-// applyAssetGate 是任务级目标白名单闸门：从工具入参提取测试目标，跑判定核心
-// gateCheck。定位是防误伤的策略闸门，提取器只是「疑似越界」的廉价触发器：
+// knownNetTools 是预筛用的已知网络工具名（纯模型架构下只判断「这条调用像要
+// 联网」）。清单刻意宽松：误中只会多一次模型复核，漏过只会少一次复核（模型
+// 本也看不出变量间接目标），两侧都无害。
+var knownNetTools = []string{
+	"curl", "wget", "nc", "ncat", "netcat", "socat", "openssl", "ping", "dig",
+	"nslookup", "whois", "traceroute", "nmap", "masscan", "naabu", "rustscan",
+	"unicornscan", "sqlmap", "nikto", "whatweb", "dirb", "hydra", "medusa",
+	"testssl.sh", "sslscan", "ffuf", "gobuster", "dirsearch", "wfuzz",
+	"feroxbuster", "httpx", "nuclei", "enum4linux", "smbclient", "telnet",
+	"ssh", "ftp", "tcpdump", "mitmproxy", "hashcat", "john",
+}
+
+var (
+	reSignalIPv4   = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	reSignalIPv6   = regexp.MustCompile(`\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f]{0,4}:[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:.]+`)
+	reSignalDotted = regexp.MustCompile(`[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
+)
+
+// hasNetworkSignal 是纯模型闸门的极简预筛：文本里连一个联网信号都没有（无
+// scheme、无 IP、无点分域名形、非已知网络工具）→ 判定「不涉及网络访问」，
+// 直接放行零模型调用。预筛只影响「是否送模型」，不影响裁决——误中 = 多一次
+// 复核（无害），漏过 = 少一次复核（模型本也读不出变量间接目标）。
+func hasNetworkSignal(text string) bool {
+	if strings.Contains(text, "://") {
+		return true
+	}
+	if reSignalIPv4.MatchString(text) || reSignalIPv6.MatchString(text) || reSignalDotted.MatchString(text) {
+		return true
+	}
+	for _, t := range knownNetTools {
+		if strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyAssetGate 是任务级目标白名单闸门：纯模型判断（无提取器）——有启用规则
+// 且调用带联网信号时，整条入参交模型裁决真实网络访问是否越界：
 //   - taskID<=0（顶层 chat 等）或 assets/rulesFn 均未设 → 放行（闸门关闭）；
 //   - 规则读取失败 → 放行（fail-open，与 insert_assets 资产闸门一致）；
-//   - 无启用规则 → 放行且不提取目标（零开销短路）；
-//   - 提取不到目标 → 放行（记 debug 日志，仅在白名单启用时走到这里）；
-//   - block 规则命中 → 确定性拦截；allow 越界 → 模型复核终审（gateCheck）。
+//   - 无启用规则 → 放行（零开销短路）；
+//   - 无联网信号（echo/cat 本地文件等）→ 放行零模型调用（极简预筛）；
+//   - 其余 → 模型终审（gateCheck，靶标流量/非靶标联网查询两类口径）。
 func (g *Guard) applyAssetGate(ctx context.Context, ev hook.Event, cmd string) hook.Result {
 	if g.taskID <= 0 || (!gateTools[ev.ToolName]) {
 		return hook.Result{}
@@ -139,14 +177,13 @@ func (g *Guard) applyAssetGate(ctx context.Context, ev hook.Event, cmd string) h
 		return hook.Result{}
 	}
 	if len(block) == 0 && !db.HasEnabledRule(allow) {
-		return hook.Result{} // 未启用白名单/拦截：不提取目标，零开销
+		return hook.Result{} // 未启用白名单/拦截：零开销
 	}
-	targets := ExtractTargets(ev.ToolName, ev.Input)
-	if len(targets) == 0 {
-		slog.Debug("guard: 白名单启用但未提取到目标，放行", "taskID", g.taskID, "tool", ev.ToolName)
+	// 预筛看原始入参（Bash 命令 / WebFetch 的 URL JSON / shell 文本都在其中）。
+	if !hasNetworkSignal(string(ev.Input)) {
 		return hook.Result{}
 	}
-	reason, denied := g.gateCheck(ctx, ev.ToolName, ev.Input, block, allow, targets)
+	reason, denied := g.gateCheck(ctx, ev.ToolName, ev.Input, block, allow)
 	if !denied {
 		return hook.Result{}
 	}
@@ -163,34 +200,27 @@ func (g *Guard) loadGateRules() (block, allow []db.AssetInterceptRule, err error
 }
 
 // gateCheck 是白名单判定核心（PreToolUse 闸门与自定义工具渲染后校验共用）：
-//   - block 规则命中 → 确定性拒绝（用户显式规则，不经模型），落拦截历史；
-//   - allow 越界 → 模型复核终审（JudgeTaskWhitelist，prompt 由
-//     TaskWhitelistJudgePrompt 构造）：allow → 放行；deny → 拒；ask → 转人工
-//     （HandleAsk 复用既有审批链路；无 interceptor/审批不通过/工作已取消 → 拦）；
+// 纯模型判断——判定权 100% 在模型，无提取、无规则匹配。模型通读完整参数找
+// 出全部真实网络目的地，按「靶标流量 / 非靶标联网查询」两类口径裁决（提示词
+// 见 TaskWhitelistJudgePrompt）：
+//   - deny → 拦（模型 reason，[任务白名单] 前缀 → interceptSource 归因 rule）；
+//   - allow → 放行并留痕（拦截历史可查）；
+//   - ask → 转人工（HandleAsk 复用既有审批链路；无 interceptor/审批不通过/
+//     工作已取消 → 拦）；
 //   - 复核不可用（judge 未接线/开关关/超时/裁决不可解析）→ 放行（fail-open：
-//     模型不可用时任务本身也无法继续，不保留确定性兜底）。
+//     模型不可用时任务本身也无法继续，不保留兜底）。
 //
 // 返回原始拒绝理由（[任务白名单] 前缀，interceptSource 据此归因 rule 来源）。
-func (g *Guard) gateCheck(ctx context.Context, toolName string, input json.RawMessage, block, allow []db.AssetInterceptRule, targets []Target) (string, bool) {
-	v := checkTargetsOnRules(block, allow, targets)
-	switch {
-	case v.blockHit:
-		g.logGate(ctx, toolName, input, "denied", v.denyReason)
-		return v.denyReason, true
-	case !v.allowDenied:
-		return "", false
-	}
-	// 提取器仅触发复核，无拦截权：模型读整条调用判真实网络目标是否全在白名单内。
-	prompt := intercept.TaskWhitelistJudgePrompt(block, allow, v.suspected)
+func (g *Guard) gateCheck(ctx context.Context, toolName string, input json.RawMessage, block, allow []db.AssetInterceptRule) (string, bool) {
+	prompt := intercept.TaskWhitelistJudgePrompt(block, allow)
 	var dec intercept.Decision
 	var judged bool
 	if g.judge != nil {
 		dec, judged = g.judge(ctx, toolName, input, prompt)
 	}
 	if !judged {
-		slog.Warn("guard: 白名单模型复核不可用，按 fail-open 放行", "taskID", g.taskID, "tool", toolName, "suspected", v.suspected)
-		g.logGate(ctx, toolName, input, "allowed",
-			"[任务白名单] 模型复核不可用，按 fail-open 放行。提取器疑似越界目标："+v.suspected)
+		slog.Warn("guard: 白名单模型复核不可用，按 fail-open 放行", "taskID", g.taskID, "tool", toolName)
+		g.logGate(ctx, toolName, input, "allowed", "[任务白名单] 模型复核不可用，按 fail-open 放行")
 		return "", false
 	}
 	switch dec.Action {
@@ -198,7 +228,7 @@ func (g *Guard) gateCheck(ctx context.Context, toolName string, input json.RawMe
 		g.logGate(ctx, toolName, input, "allowed", "[任务白名单] 模型复核放行："+dec.Message)
 		return "", false
 	case "deny":
-		reason := "[任务白名单] 模型复核确认越界，禁止访问。" + strings.TrimPrefix(dec.Message, "[模型] ")
+		reason := "[任务白名单] 模型复核拦截。" + strings.TrimPrefix(dec.Message, "[模型] ")
 		g.logGate(ctx, toolName, input, "denied", reason)
 		return reason, true
 	default: // ask → 转人工审批（pending 进任务活动流；审批不通过 → 拦）
@@ -209,7 +239,7 @@ func (g *Guard) gateCheck(ctx context.Context, toolName string, input json.RawMe
 		if g.interceptor != nil && g.interceptor.HandleAsk(ctx, intercept.ConvIDFromContext(ctx), dec, toolName, input) {
 			return "", false
 		}
-		return "[任务白名单] 模型无法确认目标在白名单内（转人工审批未通过或不可用），禁止访问", true
+		return "[任务白名单] 模型无法确认调用在授权范围内（转人工审批未通过或不可用），禁止访问", true
 	}
 }
 
@@ -226,12 +256,12 @@ func (g *Guard) logGate(ctx context.Context, toolName string, input json.RawMess
 		intercept.Decision{Action: action, Message: reason}, toolName, input, status)
 }
 
-// CheckAllowedTargets 是自定义工具渲染后目标的白名单判定入口（server.customtool
+// CheckAllowedTargets 是自定义工具渲染后文本的白名单判定入口（server.customtool
 // 调用）：自定义工具不走 PreToolUse 闸门（PreToolUse 只有参数 JSON、拿不到渲染
-// 后的 URL/命令），渲染后在此用同一 gateCheck 核心校验。input 是渲染后的完整
-// 参数（供模型复核读取真实目标）。
-func (g *Guard) CheckAllowedTargets(ctx context.Context, toolName string, input json.RawMessage, targets []Target) (string, bool) {
-	if g.taskID <= 0 || g.assets == nil || len(targets) == 0 {
+// 后的 URL/命令），渲染后在此用同一纯模型 gateCheck 核心校验。renderedText 是
+// 渲染后的完整文本（预筛用；模型复核读 input 里的同一内容）。
+func (g *Guard) CheckAllowedTargets(ctx context.Context, toolName string, input json.RawMessage, renderedText string) (string, bool) {
+	if g.taskID <= 0 || g.assets == nil {
 		return "", false
 	}
 	block, allow, err := g.loadGateRules()
@@ -242,7 +272,10 @@ func (g *Guard) CheckAllowedTargets(ctx context.Context, toolName string, input 
 	if len(block) == 0 && !db.HasEnabledRule(allow) {
 		return "", false
 	}
-	return g.gateCheck(ctx, toolName, input, block, allow, targets)
+	if !hasNetworkSignal(renderedText) {
+		return "", false
+	}
+	return g.gateCheck(ctx, toolName, input, block, allow)
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
