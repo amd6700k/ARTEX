@@ -154,3 +154,20 @@ func TestTaskWhitelistJudgePromptCustomBody(t *testing.T) {
 		t.Fatalf("空白自定义正文应回退内置模板")
 	}
 }
+
+func TestEffectiveWhitelistJudgeTemplate(t *testing.T) {
+	tmpl := EffectiveWhitelistJudgeTemplate()
+	// 模板全文 = 内置正文 + 信封 + 口径覆盖，不含任务规则清单（清单按任务动态嵌入）。
+	if !strings.Contains(tmpl, defaultWhitelistJudgeBody) || !strings.Contains(tmpl, JudgeContextBoundary) ||
+		!strings.Contains(tmpl, taskWhitelistOverride) {
+		t.Fatalf("模板应含内置正文、信任边界与口径覆盖")
+	}
+	if strings.Contains(tmpl, "（未启用允许规则）") {
+		t.Fatalf("模板不应包含动态规则清单段落")
+	}
+	// 完整提示词以内置正文开头（规则清单嵌在正文与信封之间），与模板共享同一段正文。
+	full := TaskWhitelistJudgePrompt(nil, nil, "")
+	if !strings.HasPrefix(full, defaultWhitelistJudgeBody) {
+		t.Fatalf("完整提示词应以内置正文开头")
+	}
+}

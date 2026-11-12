@@ -346,13 +346,13 @@ type JudgeConfig struct {
 	// TaskWhitelistEnabled 独立于 Enabled：控制 guard 任务白名单闸门的模型复核
 	// （JudgeTaskWhitelist），与破坏性兜底裁决（Judge）互不影响。以下 Whitelist*
 	// 字段是白名单复核的独立判定配置，默认跟随兜底审批（保持既有行为）。
-	TaskWhitelistEnabled        bool   `json:"task_whitelist_enabled"`
-	WhitelistProfileID          int64  `json:"whitelist_profile_id"` // -1=跟随兜底审批模型, 0=跟随激活配置, >0=档案
-	WhitelistPrompt             string `json:"whitelist_prompt"`     // ""=内置模板
-	WhitelistTimeoutSeconds     int    `json:"whitelist_timeout_seconds"`
-	WhitelistFailAction         string `json:"whitelist_fail_action"` // allow|ask|deny
-	WhitelistAskTimeoutSeconds  int    `json:"whitelist_ask_timeout_seconds"`
-	WhitelistAskTimeoutAction   string `json:"whitelist_ask_timeout_action"` // allow|deny
+	TaskWhitelistEnabled       bool   `json:"task_whitelist_enabled"`
+	WhitelistProfileID         int64  `json:"whitelist_profile_id"` // -1=跟随兜底审批模型, 0=跟随激活配置, >0=档案
+	WhitelistPrompt            string `json:"whitelist_prompt"`     // ""=内置模板
+	WhitelistTimeoutSeconds    int    `json:"whitelist_timeout_seconds"`
+	WhitelistFailAction        string `json:"whitelist_fail_action"` // allow|ask|deny
+	WhitelistAskTimeoutSeconds int    `json:"whitelist_ask_timeout_seconds"`
+	WhitelistAskTimeoutAction  string `json:"whitelist_ask_timeout_action"` // allow|deny
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -360,18 +360,18 @@ type JudgeConfig struct {
 // follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
 func (i *Interceptor) judgeConfig() JudgeConfig {
 	c := JudgeConfig{
-		Enabled:              i.db.GetBool(settingJudgeEnabled, false),
-		ProfileID:            int64(i.getSettingInt(settingJudgeProfileID, 0)),
-		TimeoutSeconds:       i.getSettingInt(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
-		FailAction:           i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
-		AskTimeoutSeconds:    i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
-		AskTimeoutAction:     i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
-		TaskWhitelistEnabled:        i.db.GetBool(settingJudgeTaskWhitelist, defaultJudgeTaskWhitelist),
-		WhitelistProfileID:          int64(i.getSettingInt(settingJudgeWhitelistProfileID, defaultJudgeWhitelistProfileID)),
-		WhitelistTimeoutSeconds:     i.getSettingInt(settingJudgeWhitelistTimeout, defaultJudgeWhitelistTimeout),
-		WhitelistFailAction:         i.getSettingChoice(settingJudgeWhitelistFailAction, defaultJudgeWhitelistFailAction, "allow", "ask", "deny"),
-		WhitelistAskTimeoutSeconds:  i.getSettingInt(settingJudgeWhitelistAskTimeout, defaultJudgeWhitelistAskTimeout),
-		WhitelistAskTimeoutAction:   i.getSettingChoice(settingJudgeWhitelistAskAction, defaultJudgeWhitelistAskAction, "allow", "deny"),
+		Enabled:                    i.db.GetBool(settingJudgeEnabled, false),
+		ProfileID:                  int64(i.getSettingInt(settingJudgeProfileID, 0)),
+		TimeoutSeconds:             i.getSettingInt(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
+		FailAction:                 i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
+		AskTimeoutSeconds:          i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
+		AskTimeoutAction:           i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
+		TaskWhitelistEnabled:       i.db.GetBool(settingJudgeTaskWhitelist, defaultJudgeTaskWhitelist),
+		WhitelistProfileID:         int64(i.getSettingInt(settingJudgeWhitelistProfileID, defaultJudgeWhitelistProfileID)),
+		WhitelistTimeoutSeconds:    i.getSettingInt(settingJudgeWhitelistTimeout, defaultJudgeWhitelistTimeout),
+		WhitelistFailAction:        i.getSettingChoice(settingJudgeWhitelistFailAction, defaultJudgeWhitelistFailAction, "allow", "ask", "deny"),
+		WhitelistAskTimeoutSeconds: i.getSettingInt(settingJudgeWhitelistAskTimeout, defaultJudgeWhitelistAskTimeout),
+		WhitelistAskTimeoutAction:  i.getSettingChoice(settingJudgeWhitelistAskAction, defaultJudgeWhitelistAskAction, "allow", "deny"),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -424,8 +424,15 @@ func (i *Interceptor) getSettingChoice(key, def string, allowed ...string) strin
 }
 
 // GetJudgeConfig returns the resolved judge configuration for the API/UI. Prompt
-// is the effective prompt (built-in template when unset), so the UI can prefill.
-func (i *Interceptor) GetJudgeConfig() JudgeConfig { return i.judgeConfig() }
+// and WhitelistPrompt are the effective templates (built-in text when unset), so
+// the UI can prefill both editors directly.
+func (i *Interceptor) GetJudgeConfig() JudgeConfig {
+	c := i.judgeConfig()
+	if strings.TrimSpace(c.WhitelistPrompt) == "" {
+		c.WhitelistPrompt = EffectiveWhitelistJudgeTemplate()
+	}
+	return c
+}
 
 // SetJudgeConfig persists the judge configuration. An empty Prompt clears the
 // override (the built-in template is used again).
@@ -463,7 +470,15 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := i.db.SetSetting(settingJudgeWhitelistProfileID, strconv.FormatInt(c.WhitelistProfileID, 10)); err != nil {
 		return err
 	}
-	if err := i.db.SetSetting(settingJudgeWhitelistPrompt, c.WhitelistPrompt); err != nil {
+	// Store the whitelist prompt only when it differs from the built-in template,
+	// so version updates to the built-in body flow through for users who never
+	// customized it (same policy as the fallback judge prompt above).
+	whitelistPromptToStore := ""
+	if strings.TrimSpace(c.WhitelistPrompt) != "" &&
+		strings.TrimSpace(c.WhitelistPrompt) != strings.TrimSpace(EffectiveWhitelistJudgeTemplate()) {
+		whitelistPromptToStore = c.WhitelistPrompt
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistPrompt, whitelistPromptToStore); err != nil {
 		return err
 	}
 	if err := i.db.SetSetting(settingJudgeWhitelistTimeout, strconv.Itoa(c.WhitelistTimeoutSeconds)); err != nil {
