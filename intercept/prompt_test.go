@@ -82,7 +82,7 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 		{Kind: "host_port", Pattern: "10.10.5.238:8443", Enabled: false}, // 未启用不列出
 	}
 	block := []db.AssetInterceptRule{{Kind: "fuzzy_domain", Pattern: ".gov.cn", Enabled: true}}
-	prompt := TaskWhitelistJudgePrompt(block, allow)
+	prompt := TaskWhitelistJudgePrompt(block, allow, "")
 
 	// 启用的允许规则逐条编号；未启用的不进清单。
 	if !strings.Contains(prompt, "- WL-1 [主机+端口] 10.10.5.238:9001") {
@@ -121,7 +121,7 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 		t.Fatalf("口径覆盖应说明非靶标查询的命中规则填写方式")
 	}
 	// 无允许规则时不产 WL 编号，且只按 BLK 判定。
-	empty := TaskWhitelistJudgePrompt(nil, nil)
+	empty := TaskWhitelistJudgePrompt(nil, nil, "")
 	if !strings.Contains(empty, "（未启用允许规则）") {
 		t.Fatalf("空白名单应有明确说明: %s", empty)
 	}
@@ -130,5 +130,27 @@ func TestTaskWhitelistJudgePrompt(t *testing.T) {
 	}
 	if !strings.Contains(empty, "只按 BLK 拦截规则判定") {
 		t.Fatalf("空白名单应声明只按拦截规则判定: %s", empty)
+	}
+}
+
+func TestTaskWhitelistJudgePromptCustomBody(t *testing.T) {
+	allow := []db.AssetInterceptRule{{Kind: "host_port", Pattern: "10.10.5.238:9001", Enabled: true}}
+	custom := "# 我的范围政策\n只放行靶标端口，其余全拒。"
+	prompt := TaskWhitelistJudgePrompt(nil, allow, custom)
+
+	// 自定义正文替换内置正文（内置口径语句不再出现）。
+	if !strings.Contains(prompt, custom) || strings.Contains(prompt, "非靶标的合法联网查询") {
+		t.Fatalf("自定义正文应替换内置正文: %s", prompt)
+	}
+	// 规则清单/信封/口径覆盖始终程序化追加，自定义提示词丢不掉白名单规则。
+	if !strings.Contains(prompt, "- WL-1 [主机+端口] 10.10.5.238:9001") {
+		t.Fatalf("自定义正文下规则清单不得丢失: %s", prompt)
+	}
+	if !strings.Contains(prompt, JudgeContextBoundary) || !strings.Contains(prompt, taskWhitelistOverride) {
+		t.Fatalf("自定义正文下信封与口径覆盖不得丢失")
+	}
+	// 空白正文回退内置模板。
+	if p2 := TaskWhitelistJudgePrompt(nil, allow, "   "); !strings.Contains(p2, "非靶标的合法联网查询") {
+		t.Fatalf("空白自定义正文应回退内置模板")
 	}
 }

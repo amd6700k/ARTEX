@@ -28,17 +28,21 @@ func allowRule() []db.AssetInterceptRule {
 	return []db.AssetInterceptRule{{Kind: "host_port", Pattern: "10.10.5.238:9001", Enabled: true}}
 }
 
-// judgeMock 是 judge 测试缝的 mock：记录调用次数与收到的提示词，回放固定裁决。
+// judgeMock 是 judge 测试缝的 mock：记录调用次数与规则参数，回放固定裁决。
+// prompt 按收到的规则经 TaskWhitelistJudgePrompt（内置正文）现生成，供文案断言。
 type judgeMock struct {
 	calls  int
 	prompt string
+	block  []db.AssetInterceptRule
+	allow  []db.AssetInterceptRule
 	dec    intercept.Decision
 	ok     bool
 }
 
-func (m *judgeMock) hook(ctx context.Context, tool string, input json.RawMessage, prompt string) (intercept.Decision, bool) {
+func (m *judgeMock) hook(ctx context.Context, tool string, input json.RawMessage, block, allow []db.AssetInterceptRule) (intercept.Decision, bool) {
 	m.calls++
-	m.prompt = prompt
+	m.block, m.allow = block, allow
+	m.prompt = intercept.TaskWhitelistJudgePrompt(block, allow, "")
 	return m.dec, m.ok
 }
 

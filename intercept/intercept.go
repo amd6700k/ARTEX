@@ -309,6 +309,13 @@ const (
 	settingJudgeAskTimeoutSecs   = "llm_judge_ask_timeout_seconds"
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
 	settingJudgeTaskWhitelist    = "llm_judge_task_whitelist"
+
+	settingJudgeWhitelistProfileID  = "llm_judge_whitelist_profile_id"
+	settingJudgeWhitelistPrompt     = "llm_judge_whitelist_prompt"
+	settingJudgeWhitelistTimeout    = "llm_judge_whitelist_timeout_seconds"
+	settingJudgeWhitelistFailAction = "llm_judge_whitelist_fail_action"
+	settingJudgeWhitelistAskTimeout = "llm_judge_whitelist_ask_timeout_seconds"
+	settingJudgeWhitelistAskAction  = "llm_judge_whitelist_ask_timeout_action"
 )
 
 // Judge default values.
@@ -318,6 +325,12 @@ const (
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 	defaultJudgeTaskWhitelist    = true
+
+	defaultJudgeWhitelistProfileID  = -1 // 跟随兜底审批模型
+	defaultJudgeWhitelistTimeout    = 15
+	defaultJudgeWhitelistFailAction = "allow"
+	defaultJudgeWhitelistAskTimeout = 300
+	defaultJudgeWhitelistAskAction  = "deny"
 )
 
 // JudgeConfig is the resolved LLM-fallback-judge configuration. Prompt is always
@@ -331,8 +344,15 @@ type JudgeConfig struct {
 	AskTimeoutSeconds int    `json:"ask_timeout_seconds"`
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
 	// TaskWhitelistEnabled 独立于 Enabled：控制 guard 任务白名单闸门的模型复核
-	// （JudgeTaskWhitelist），与破坏性兜底裁决（Judge）互不影响。
-	TaskWhitelistEnabled bool `json:"task_whitelist_enabled"`
+	// （JudgeTaskWhitelist），与破坏性兜底裁决（Judge）互不影响。以下 Whitelist*
+	// 字段是白名单复核的独立判定配置，默认跟随兜底审批（保持既有行为）。
+	TaskWhitelistEnabled        bool   `json:"task_whitelist_enabled"`
+	WhitelistProfileID          int64  `json:"whitelist_profile_id"` // -1=跟随兜底审批模型, 0=跟随激活配置, >0=档案
+	WhitelistPrompt             string `json:"whitelist_prompt"`     // ""=内置模板
+	WhitelistTimeoutSeconds     int    `json:"whitelist_timeout_seconds"`
+	WhitelistFailAction         string `json:"whitelist_fail_action"` // allow|ask|deny
+	WhitelistAskTimeoutSeconds  int    `json:"whitelist_ask_timeout_seconds"`
+	WhitelistAskTimeoutAction   string `json:"whitelist_ask_timeout_action"` // allow|deny
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -346,7 +366,12 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		FailAction:           i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
 		AskTimeoutSeconds:    i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:     i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
-		TaskWhitelistEnabled: i.db.GetBool(settingJudgeTaskWhitelist, defaultJudgeTaskWhitelist),
+		TaskWhitelistEnabled:        i.db.GetBool(settingJudgeTaskWhitelist, defaultJudgeTaskWhitelist),
+		WhitelistProfileID:          int64(i.getSettingInt(settingJudgeWhitelistProfileID, defaultJudgeWhitelistProfileID)),
+		WhitelistTimeoutSeconds:     i.getSettingInt(settingJudgeWhitelistTimeout, defaultJudgeWhitelistTimeout),
+		WhitelistFailAction:         i.getSettingChoice(settingJudgeWhitelistFailAction, defaultJudgeWhitelistFailAction, "allow", "ask", "deny"),
+		WhitelistAskTimeoutSeconds:  i.getSettingInt(settingJudgeWhitelistAskTimeout, defaultJudgeWhitelistAskTimeout),
+		WhitelistAskTimeoutAction:   i.getSettingChoice(settingJudgeWhitelistAskAction, defaultJudgeWhitelistAskAction, "allow", "deny"),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -354,11 +379,20 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 	} else {
 		c.Prompt = DefaultJudgePrompt
 	}
+	if v, ok, _ := i.db.GetSetting(settingJudgeWhitelistPrompt); ok && strings.TrimSpace(v) != "" {
+		c.WhitelistPrompt = v
+	}
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = defaultJudgeTimeoutSecs
 	}
 	if c.AskTimeoutSeconds <= 0 {
 		c.AskTimeoutSeconds = defaultJudgeAskTimeoutSecs
+	}
+	if c.WhitelistTimeoutSeconds <= 0 {
+		c.WhitelistTimeoutSeconds = defaultJudgeWhitelistTimeout
+	}
+	if c.WhitelistAskTimeoutSeconds <= 0 {
+		c.WhitelistAskTimeoutSeconds = defaultJudgeWhitelistAskTimeout
 	}
 	return c
 }
@@ -426,45 +460,50 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := i.db.SetBool(settingJudgeTaskWhitelist, c.TaskWhitelistEnabled); err != nil {
 		return err
 	}
+	if err := i.db.SetSetting(settingJudgeWhitelistProfileID, strconv.FormatInt(c.WhitelistProfileID, 10)); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistPrompt, c.WhitelistPrompt); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistTimeout, strconv.Itoa(c.WhitelistTimeoutSeconds)); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistFailAction, c.WhitelistFailAction); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistAskTimeout, strconv.Itoa(c.WhitelistAskTimeoutSeconds)); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeWhitelistAskAction, c.WhitelistAskTimeoutAction); err != nil {
+		return err
+	}
 	return nil
 }
 
-// Judge 复核管线的三类可区分失败：reviewer 未接线（Judge 返回未裁决，调用方
-// 保持现状；白名单复核返回后调用方放行）、当前参数不完整（不能如实裁决，必须
-// 转人工）、模型输出不可解析（按调用方失败策略处理）。
-var (
-	errJudgeUnwired = errors.New("模型复核未接线")
-	errJudgeContext = errors.New("审查上下文不完整")
-	errJudgeParse   = errors.New("模型输出无法解析")
-)
-
-// judgeAttempt 是一次模型复核尝试的完整结果。
-type judgeAttempt struct {
-	dec    Decision // ok=true 时为已补齐审计字段的终审裁决
-	ok     bool
-	runErr error // ok=false 时的失败原因（errors.Is 区分上面三类哨兵）
-
-	// 以下字段供调用方按自身策略构造兜底裁决（Judge 的 FailAction 路径用），
-	// 保证失败路径的审计行（ModelInput 摘要、ProfileID）与成功路径同保真度：
-	modelInput []byte // 已序列化的审查输入
-	profileID  int64  // reviewer 返回的部分 ProfileID
+// judgePolicy 描述一次复核运行的判定参数：模型档案、超时、失败策略与 ask 人审
+// 超时。Judge 用兜底审批的全局配置，JudgeTaskWhitelist 用白名单复核的独立配置。
+type judgePolicy struct {
+	profileID         int64
+	timeoutSeconds    int
+	failAction        string // allow|ask|deny
+	askTimeoutSeconds int
+	askTimeoutAction  string // allow|deny
 }
 
 // tagVerdict 补齐一条裁决的审计字段：RuleID=0（模型裁决不关联规则行）、
-// ModelInput 摘要、ProfileID 归一、ConfigDigest、[模型] 消息前缀、ask 人审超时。
-// 成功裁决与 Judge 的失败兜底共用。
-func (i *Interceptor) tagVerdict(out Decision, modelInput []byte, cfg JudgeConfig) Decision {
+// ModelInput 摘要、ProfileID 归一（reviewer 返回的部分 ProfileID 优先）、
+// ConfigDigest、[模型] 消息前缀、ask 人审超时。成功裁决与失败兜底共用。
+func tagVerdict(out Decision, modelInput []byte, fallbackProfileID int64, configDigest string, p judgePolicy) Decision {
 	out.RuleID = 0
 	if len(modelInput) > 0 {
 		out.ModelInput = modelInput
 		out.ModelInputDigest = digestInput(modelInput)
 	}
-	if out.ProfileID != 0 {
-		cfg.ProfileID = out.ProfileID
+	if out.ProfileID == 0 {
+		out.ProfileID = fallbackProfileID
 	}
-	out.ProfileID = cfg.ProfileID
-	configJSON, _ := json.Marshal(cfg)
-	out.ConfigDigest = digestInput(configJSON)
+	out.ConfigDigest = configDigest
 	if out.Message == "" {
 		out.Message = "[模型] " + judgeActionLabel(out.Action)
 	} else if !strings.HasPrefix(out.Message, "[模型]") {
@@ -472,47 +511,63 @@ func (i *Interceptor) tagVerdict(out Decision, modelInput []byte, cfg JudgeConfi
 	}
 	if out.Action == "ask" {
 		out.TimeoutEnabled = true
-		out.TimeoutSeconds = cfg.AskTimeoutSeconds
-		out.TimeoutAction = cfg.AskTimeoutAction
+		out.TimeoutSeconds = p.askTimeoutSeconds
+		out.TimeoutAction = p.askTimeoutAction
 	}
 	return out
 }
 
-// judgeRun 是 Judge 与 JudgeTaskWhitelist 共享的复核管线：超时 → 审查输入信封 →
-// reviewer 调用 → tagVerdict。失败时携带 modelInput/profileID 返回，兜底策略
-// （FailAction / 放行）由调用方自定。
-func (i *Interceptor) judgeRun(ctx context.Context, tool string, arguments json.RawMessage, prompt string) judgeAttempt {
+// judgeRunPolicy 是 Judge 与 JudgeTaskWhitelist 共享的复核管线：超时 → 审查输入
+// 信封 → reviewer 调用 → 裁决补齐。reviewer 未接线返回 (Decision{}, false)（调
+// 用方各自维持「未裁决」语义）；当前参数不完整 → ask 终审（不论失败策略——残缺
+// 参数无法如实裁决，必须人工，与既有行为一致）；其余失败（模型错误/超时/不可
+// 解析）→ 按 p.failAction 出终审裁决。失败路径的审计字段（ModelInput 摘要、
+// ProfileID）与成功路径同保真度。
+func (i *Interceptor) judgeRunPolicy(ctx context.Context, tool string, arguments json.RawMessage, prompt string, p judgePolicy) (Decision, bool) {
 	i.mu.RLock()
 	rv := i.reviewer
 	i.mu.RUnlock()
 	if rv == nil {
-		return judgeAttempt{runErr: errJudgeUnwired}
+		return Decision{}, false
 	}
-	cfg := i.judgeConfig()
 
 	cctx := ctx
-	if cfg.TimeoutSeconds > 0 {
+	if p.timeoutSeconds > 0 {
 		var cancel context.CancelFunc
-		cctx, cancel = context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+		cctx, cancel = context.WithTimeout(ctx, time.Duration(p.timeoutSeconds)*time.Second)
 		defer cancel()
 	}
 
 	input, contextErr := BuildReviewInput(cctx, tool, arguments)
-	if contextErr != nil {
-		return judgeAttempt{runErr: fmt.Errorf("%w：%v", errJudgeContext, contextErr)}
+	var modelInput []byte
+	if contextErr == nil {
+		modelInput, _ = json.Marshal(input)
 	}
-	modelInput, _ := json.Marshal(input)
-	out, err := rv(cctx, cfg.ProfileID, prompt, input)
+	configJSON, _ := json.Marshal(map[string]any{
+		"profile_id": p.profileID, "timeout_seconds": p.timeoutSeconds,
+		"fail_action": p.failAction, "prompt_len": len(prompt),
+	})
+	configDigest := digestInput(configJSON)
+
+	fail := func(action, msg string, partialProfile int64) (Decision, bool) {
+		d := Decision{ProfileID: partialProfile, ModelFallback: true, Action: action, Message: msg}
+		return tagVerdict(d, modelInput, p.profileID, configDigest, p), true
+	}
+
+	if contextErr != nil {
+		return fail("ask", "审查上下文不完整，需要人工确认："+contextErr.Error(), 0)
+	}
+	out, err := rv(cctx, p.profileID, prompt, input)
 	if err != nil {
-		return judgeAttempt{runErr: err, modelInput: modelInput, profileID: out.ProfileID}
+		return fail(p.failAction, "模型审批失败,按失败策略处理: "+err.Error(), out.ProfileID)
 	}
 	switch out.Action {
 	case "allow", "ask", "deny":
 		// valid verdict
 	default:
-		return judgeAttempt{runErr: errJudgeParse, modelInput: modelInput, profileID: out.ProfileID}
+		return fail(p.failAction, "模型输出无法解析,按失败策略处理", out.ProfileID)
 	}
-	return judgeAttempt{dec: i.tagVerdict(out, modelInput, cfg), ok: true}
+	return tagVerdict(out, modelInput, p.profileID, configDigest, p), true
 }
 
 // Judge runs the LLM fallback judge for a tool call that matched no rule. It
@@ -526,41 +581,59 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	if !cfg.Enabled {
 		return Decision{}, false
 	}
-	cfg.Prompt = EffectiveJudgePrompt(cfg.Prompt)
-
-	at := i.judgeRun(ctx, tool, arguments, cfg.Prompt)
-	if at.ok {
-		return at.dec, true
-	}
-	switch {
-	case errors.Is(at.runErr, errJudgeUnwired):
-		return Decision{}, false
-	case errors.Is(at.runErr, errJudgeContext):
-		// Invalid current arguments cannot be reviewed faithfully, regardless of
-		// the configured model-failure strategy. A human must resolve the input.
-		d := Decision{Action: "ask", ModelFallback: true, Message: "审查上下文不完整，需要人工确认：" + strings.TrimPrefix(at.runErr.Error(), errJudgeContext.Error()+"：")}
-		return i.tagVerdict(d, at.modelInput, cfg), true
-	default:
-		msg := "模型审批失败,按失败策略处理: " + at.runErr.Error()
-		if errors.Is(at.runErr, errJudgeParse) {
-			msg = "模型输出无法解析,按失败策略处理"
-		}
-		d := Decision{ProfileID: at.profileID, ModelFallback: true, Action: cfg.FailAction, Message: msg}
-		return i.tagVerdict(d, at.modelInput, cfg), true
-	}
+	return i.judgeRunPolicy(ctx, tool, arguments, EffectiveJudgePrompt(cfg.Prompt), judgePolicy{
+		profileID:         cfg.ProfileID,
+		timeoutSeconds:    cfg.TimeoutSeconds,
+		failAction:        cfg.FailAction,
+		askTimeoutSeconds: cfg.AskTimeoutSeconds,
+		askTimeoutAction:  cfg.AskTimeoutAction,
+	})
 }
 
-// JudgeTaskWhitelist 跑 guard 任务白名单闸门的模型复核（prompt 由调用方经
-// TaskWhitelistJudgePrompt 构造）。与 Judge 不同，它没有 FailAction 兜底：
-// 复核开关关闭（llm_judge_task_whitelist）、reviewer 未接线、超时或裁决不可
-// 解析一律返回 (Decision{}, false)，由调用方放行（fail-open——模型不可用时
-// 任务本身也无法继续，不保留确定性兜底）。
-func (i *Interceptor) JudgeTaskWhitelist(ctx context.Context, tool string, arguments json.RawMessage, prompt string) (Decision, bool) {
-	if !i.judgeConfig().TaskWhitelistEnabled {
+// JudgeTaskWhitelist 跑 guard 任务白名单闸门的模型复核（纯模型判断）：规则清单
+// 由 TaskWhitelistJudgePrompt 编号化嵌入，模型/提示词/超时/失败策略用白名单复
+// 核的独立配置（whitelist_profile_id=-1 表示跟随兜底审批模型）。开关关闭
+// （llm_judge_task_whitelist）或 reviewer 未接线返回 (Decision{}, false)，由调
+// 用方放行；模型失败按 whitelist_fail_action 出终审裁决（默认 allow，保持
+// fail-open 语义）。
+func (i *Interceptor) JudgeTaskWhitelist(ctx context.Context, tool string, arguments json.RawMessage, block, allow []db.AssetInterceptRule) (Decision, bool) {
+	cfg := i.judgeConfig()
+	if !cfg.TaskWhitelistEnabled {
 		return Decision{}, false
 	}
-	at := i.judgeRun(ctx, tool, arguments, prompt)
-	return at.dec, at.ok
+	profileID := cfg.WhitelistProfileID
+	if profileID < 0 {
+		profileID = cfg.ProfileID // 跟随兜底审批模型
+	}
+	ctx = WithJudgeLane(ctx, JudgeLaneWhitelist)
+	return i.judgeRunPolicy(ctx, tool, arguments,
+		TaskWhitelistJudgePrompt(block, allow, cfg.WhitelistPrompt),
+		judgePolicy{
+			profileID:         profileID,
+			timeoutSeconds:    cfg.WhitelistTimeoutSeconds,
+			failAction:        cfg.WhitelistFailAction,
+			askTimeoutSeconds: cfg.WhitelistAskTimeoutSeconds,
+			askTimeoutAction:  cfg.WhitelistAskTimeoutAction,
+		})
+}
+
+// JudgeLane 标记一次复核的用量归属通道：兜底审批默认 judge，白名单复核
+// whitelist。Reviewer 据此打 llmrec 用量标签，两块用量卡片各算各的。
+const JudgeLaneWhitelist = "whitelist"
+
+type laneCtxKey int
+
+const judgeLaneCtxKey laneCtxKey = 1
+
+// WithJudgeLane 把用量通道标记注入 ctx，随超时子 ctx 传给 Reviewer。
+func WithJudgeLane(ctx context.Context, lane string) context.Context {
+	return context.WithValue(ctx, judgeLaneCtxKey, lane)
+}
+
+// JudgeLaneFromContext 取出用量通道标记（空串 = 默认 judge 通道）。
+func JudgeLaneFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(judgeLaneCtxKey).(string)
+	return v
 }
 
 func judgeActionLabel(action string) string {

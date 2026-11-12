@@ -2476,6 +2476,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ask_timeout_seconds: 300,
       ask_timeout_action: "deny",
       task_whitelist_enabled: true,
+      whitelist_profile_id: -1,
+      whitelist_prompt: "",
+      whitelist_timeout_seconds: 15,
+      whitelist_fail_action: "allow",
+      whitelist_ask_timeout_seconds: 300,
+      whitelist_ask_timeout_action: "deny",
     };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
   if (path === "/intercept/judge/usage" && m === "GET")

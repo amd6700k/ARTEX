@@ -46,9 +46,13 @@ func (s *Server) wireInterceptReviewer() {
 		if !ok {
 			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("裁判模型 profile %d 不可用", profileID)
 		}
-		// Tag this call's usage as the "judge" lane so the config page can report
-		// how much the fallback approval has spent, separate from model profiles.
-		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
+		// Tag this call's usage lane (judge / whitelist) so the config page can
+		// report each reviewer's spend separately, apart from model profiles.
+		lane := intercept.JudgeLaneFromContext(ctx)
+		if lane == "" {
+			lane = judgeWorkerLane
+		}
+		ctx = llmrec.WithWorker(ctx, lane)
 		text, err := reviewCompletion(ctx, prov, prompt, input)
 		if err != nil {
 			return intercept.Decision{ProfileID: profileID}, err
@@ -438,6 +442,18 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "ask_timeout_action 必须是 allow 或 deny")
 		return
 	}
+	switch req.WhitelistFailAction {
+	case "allow", "ask", "deny":
+	default:
+		writeErr(w, 400, "whitelist_fail_action 必须是 allow、ask 或 deny")
+		return
+	}
+	switch req.WhitelistAskTimeoutAction {
+	case "allow", "deny":
+	default:
+		writeErr(w, 400, "whitelist_ask_timeout_action 必须是 allow 或 deny")
+		return
+	}
 	if err := s.m.interceptor.SetJudgeConfig(req); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -454,7 +470,11 @@ func (s *Server) interceptJudgeUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	days := atoiDefault(r.URL.Query().Get("days"), 30)
-	usage, err := pg.JudgeUsageStats(days)
+	lane := r.URL.Query().Get("lane")
+	if lane != intercept.JudgeLaneWhitelist {
+		lane = judgeWorkerLane
+	}
+	usage, err := pg.JudgeUsageStats(days, lane)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

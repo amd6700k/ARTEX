@@ -49,8 +49,9 @@ type Guard struct {
 	rulesFn func() (block, allow []db.AssetInterceptRule, err error)
 
 	// judge 是白名单模型复核入口（测试缝）：默认指向 interceptor.JudgeTaskWhitelist，
-	// 测试注入 mock。nil 或返回 false = 复核不可用 → 放行（fail-open）。
-	judge func(ctx context.Context, tool string, input json.RawMessage, prompt string) (intercept.Decision, bool)
+	// 测试注入 mock。nil 或返回 false = 复核不可用 → 放行（fail-open）。提示词由
+	// Interceptor 内部按白名单独立配置（llm_judge_whitelist_*）解析。
+	judge func(ctx context.Context, tool string, input json.RawMessage, block, allow []db.AssetInterceptRule) (intercept.Decision, bool)
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -212,11 +213,10 @@ func (g *Guard) loadGateRules() (block, allow []db.AssetInterceptRule, err error
 //
 // 返回原始拒绝理由（[任务白名单] 前缀，interceptSource 据此归因 rule 来源）。
 func (g *Guard) gateCheck(ctx context.Context, toolName string, input json.RawMessage, block, allow []db.AssetInterceptRule) (string, bool) {
-	prompt := intercept.TaskWhitelistJudgePrompt(block, allow)
 	var dec intercept.Decision
 	var judged bool
 	if g.judge != nil {
-		dec, judged = g.judge(ctx, toolName, input, prompt)
+		dec, judged = g.judge(ctx, toolName, input, block, allow)
 	}
 	if !judged {
 		slog.Warn("guard: 白名单模型复核不可用，按 fail-open 放行", "taskID", g.taskID, "tool", toolName)

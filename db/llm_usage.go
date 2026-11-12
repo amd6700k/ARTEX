@@ -284,16 +284,19 @@ type JudgeUsage struct {
 // always-on llm_usage ledger, so it is accurate across pool rotation and
 // interrupted/failed judge calls. days only bounds the daily series; totals are
 // all-time.
-func (d *DB) JudgeUsageStats(days int) (JudgeUsage, error) {
+func (d *DB) JudgeUsageStats(days int, worker string) (JudgeUsage, error) {
 	if days <= 0 {
 		days = 30
+	}
+	if worker == "" {
+		worker = "judge"
 	}
 	var u JudgeUsage
 	err := d.QueryRow(`
 SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
        COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
 FROM llm_usage
-WHERE worker = 'judge'`).Scan(&u.Calls, &u.InputTokens, &u.OutputTokens,
+WHERE worker = $2`, days, worker).Scan(&u.Calls, &u.InputTokens, &u.OutputTokens,
 		&u.CacheReadTokens, &u.CacheWriteTokens)
 	if err != nil {
 		return JudgeUsage{}, err
@@ -302,9 +305,9 @@ WHERE worker = 'judge'`).Scan(&u.Calls, &u.InputTokens, &u.OutputTokens,
 SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
        COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
 FROM llm_usage
-WHERE worker = 'judge' AND ts >= now() - ($1 * interval '1 day')
+WHERE worker = $2 AND ts >= now() - ($1 * interval '1 day')
 GROUP BY day
-ORDER BY day`, days)
+ORDER BY day`, days, worker)
 	if err != nil {
 		return JudgeUsage{}, err
 	}
